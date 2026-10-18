@@ -1,0 +1,38 @@
+[package]
+name = "vr-server"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85"
+description = "HTTP server: OpenAI-compatible /v1/* routes, admin API, embedded UI."
+license = "MIT"
+publish = false
+
+[dependencies]
+vr-core = { path = "../vr-core" }
+vr-config = { path = "../vr-config" }
+vr-providers = { path = "../vr-providers" }
+vr-health = { path = "../vr-health" }
+vr-routing = { path = "../vr-routing" }
+vr-translate = { path = "../vr-translate" }
+vr-storage = { path = "../vr-storage" }
+vr-cache = { path = "../vr-cache" }
+vr-ui = { path = "../vr-ui" }
+
+axum = { version = "0.7", default-features = false, features = [
+    "http1", "json", "query", "tokio",
+] }
+tokio = { version = "1", default-features = false, features = [
+    "rt-multi-thread", "net", "signal", "time", "sync", "macros",
+] }
+serde = { version = "1", features = ["derive"] }
+serde_json.workspace = true
+futures-util = { version = "0.3", default-features = false }
+parking_lot = "0.12"
+tracing = "0.1"
+
+[dev-dependencies]
+reqwest = { version = "0.12", default-features = false, features = [
+    "json", "rustls-tls",
+] }
+vr-providers = { path = "../vr-providers", features = ["test-mock"] }
+tokio = { version = "1", features = ["full"] }

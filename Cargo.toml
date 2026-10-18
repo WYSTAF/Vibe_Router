@@ -1,0 +1,28 @@
+[workspace]
+members = ["crates/*"]
+resolver = "2"
+
+[package]
+name = "vibe-router"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85"
+description = "A single-binary, Rust-native LLM router with health-aware failover."
+license = "MIT"
+repository = "https://github.com/etemadi/vibe-router"
+publish = false
+
+[dependencies]
+vr-cli = { path = "crates/vr-cli" }
+
+# serde_json 1.0.151 pulls in `zmij`, which fails to compile on rustc 1.98
+# (it uses stdarch x86 intrinsics that have since been relocated). Pin to the
+# last release without that dependency until the ecosystem catches up.
+[workspace.dependencies]
+serde_json = "=1.0.145"
+
+[profile.release]
+opt-level = 2
+lto = "thin"
+codegen-units = 1
+strip = "symbols"

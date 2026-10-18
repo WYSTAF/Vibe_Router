@@ -1,0 +1,294 @@
+# Vibe Router — Example Configuration
+# Copy this file to `vibe-router.toml` and adjust for your providers.
+
+[server]
+host = "127.0.0.1"
+port = 20128
+# Optional API keys required from clients on `Authorization: Bearer <key>`.
+# Leave empty for open access on loopback / trusted private network.
+api_keys = []
+# Or read acceptable keys from environment variable names:
+# api_key_env = ["VIBE_ROUTER_API_KEY"]
+log_dir = "logs"
+
+[storage]
+# SQLite database file for usage metrics and runtime-authored combos.
+# An empty path `""` uses an in-memory store (nothing persists across restarts).
+sqlite_path = "vibe-router.db"
+
+[strategy]
+# Total wall-clock budget for one client request across all candidates (ms).
+request_budget_ms = 180000
+# Connection / time-to-first-byte timeout per upstream attempt (ms).
+connect_timeout_ms = 60000
+# First streamed chunk timeout (prompt prefill) (ms).
+first_chunk_timeout_ms = 180000
+# Allowed idle time between subsequent streaming chunks before aborting (ms).
+stall_timeout_ms = 300000
+
+# Same-candidate automatic retries before falling over to the next provider.
+[strategy.retry.by_status.502]
+attempts = 2
+delay_ms = 1500
+
+[strategy.retry.by_status.503]
+attempts = 1
+delay_ms = 2000
+
+[strategy.retry.by_status.504]
+attempts = 1
+delay_ms = 2000
+
+[limits.cooldown]
+# Cooldown applied to a candidate when an error triggers fallback (ms).
+transient_ms = 30000
+# Hard ceiling: no provider is ever locked out longer than this (ms).
+max_ms = 1800000
+
+[limits.backoff]
+# Exponential backoff for rate limits: base * 2^(level-1).
+base_ms = 2000
+max_ms = 300000
+max_levels = 15
+
+# Per-model rate limits (requests per minute).
+# The safety margin (default 90%) reserves buffer to avoid provoking 429s.
+[limits.rate_limits."groq/llama-3.3-70b-versatile"]
+scope = "RequestsPerMinute"
+limit = 30
+safety_margin_pct = 90
+
+[limits.rate_limits."openrouter/meta-llama/llama-3.3-70b-instruct"]
+scope = "RequestsPerMinute"
+limit = 20
+safety_margin_pct = 90
+
+# ============================================================================
+# Upstream Providers
+# ============================================================================
+
+[[providers]]
+id = "groq"
+display_name = "Groq Cloud"
+base_url = "https://api.groq.com/openai/v1/chat/completions"
+auth = { scheme = "Bearer", secret = "env:GROQ_API_KEY" }
+models = [
+    { id = "llama-3.3-70b-versatile", context = 128000 },
+    { id = "mixtral-8x7b-32768", context = 32768 }
+]
+
+[[providers]]
+id = "openrouter"
+display_name = "OpenRouter"
+base_url = "https://openrouter.ai/api/v1/chat/completions"
+auth = { scheme = "Bearer", secret = "env:OPENROUTER_API_KEY" }
+models = [
+    { id = "meta-llama/llama-3.3-70b-instruct", context = 131072 },
+    { id = "deepseek/deepseek-chat", context = 64000 },
+    { id = "anthropic/claude-3.5-sonnet", context = 200000 }
+]
+
+[[providers]]
+id = "deepseek"
+display_name = "DeepSeek Official"
+base_url = "https://api.deepseek.com/chat/completions"
+auth = { scheme = "Bearer", secret = "env:DEEPSEEK_API_KEY" }
+models = [
+    { id = "deepseek-chat", context = 64000 },
+    { id = "deepseek-reasoner", context = 64000 }
+]
+
+# --- Newly verified providers extracted from 9router ---
+
+[[providers]]
+id = "tokenharbor"
+display_name = "Token Harbor"
+base_url = "https://tokenharbor.ai/v1/chat/completions"
+auth = { scheme = "Bearer", secret = "env:TOKENHARBOR_API_KEY" }
+passthrough = true
+models = [
+    { id = "claude-opus-5.5", context = 200000 },
+    { id = "claude-sonnet-5", context = 200000 },
+    { id = "gpt-6-astra", context = 128000 },
+    { id = "gpt-6-sol", context = 128000 },
+    { id = "deepseek-v4.1-flash:free", context = 64000 },
+    { id = "grok-4.7", context = 131072 }
+]
+
+[[providers]]
+id = "cerebras"
+display_name = "Cerebras Cloud"
+base_url = "https://api.cerebras.ai/v1/chat/completions"
+auth = { scheme = "Bearer", secret = "env:CEREBRAS_API_KEY" }
+models = [
+    { id = "llama-3.3-70b", context = 128000 },
+    { id = "gpt-oss-120b", context = 128000 },
+    { id = "zai-glm-4.7", context = 128000 },
+    { id = "qwen-3-32b", context = 131072 }
+]
+
+[[providers]]
+id = "sambanova"
+display_name = "SambaNova Cloud"
+base_url = "https://api.sambanova.ai/v1/chat/completions"
+auth = { scheme = "Bearer", secret = "env:SAMBANOVA_API_KEY" }
+models = [
+    { id = "Meta-Llama-3.3-70B-Instruct", context = 131072 },
+    { id = "Qwen2.5-Coder-32B-Instruct", context = 32768 },
+    { id = "MiniMax-M2.7", context = 196608 }
+]
+
+[[providers]]
+id = "dahl"
+display_name = "Dahl Inference"
+base_url = "https://inference.dahl.global/v1/chat/completions"
+auth = { scheme = "Bearer", secret = "env:DAHL_API_KEY" }
+passthrough = true
+models = [
+    { id = "zai-org/GLM-5.3-Flash", context = 128000 },
+    { id = "deepseek-ai/DeepSeek-V4-Flash-0731", context = 64000 },
+    { id = "MiniMaxAI/MiniMax-M2.7", context = 196608 }
+]
+
+[[providers]]
+id = "atria"
+display_name = "Atria Dawn"
+base_url = "https://api.atria-asi.ai/v1/chat/completions"
+auth = { scheme = "Bearer", secret = "env:ATRIA_API_KEY" }
+passthrough = true
+models = [
+    { id = "Atria-Dawn-Preview", context = 32768 }
+]
+
+[[providers]]
+id = "agnes"
+display_name = "Agnes AI"
+base_url = "https://apihub.agnes-ai.com/v1/chat/completions"
+auth = { scheme = "Bearer", secret = "env:AGNES_API_KEY" }
+passthrough = true
+models = [
+    { id = "agnes-2.5-flash", context = 128000 },
+    { id = "agnes-2.5-pro", context = 128000 },
+    { id = "agnes-3.0-flash", context = 128000 }
+]
+
+[[providers]]
+id = "bai"
+display_name = "B.AI"
+base_url = "https://api.b.ai/v1/chat/completions"
+auth = { scheme = "Bearer", secret = "env:BAI_API_KEY" }
+passthrough = true
+models = []
+
+[[providers]]
+id = "ollama"
+display_name = "Local Ollama"
+base_url = "http://localhost:11434/v1/chat/completions"
+auth = { secret = "" } # No authentication required
+# Passthrough allows sending any model name installed in local Ollama
+passthrough = true
+models = [
+    { id = "llama3.2" },
+    { id = "qwen2.5-coder:7b" }
+]
+
+# ============================================================================
+# Model Combos (Ordered Fallback Chains)
+# ============================================================================
+
+[[combos]]
+name = "fast-cheap"
+description = "Ultra-fast Groq first, fallback to Cerebras, OpenRouter, then local Ollama"
+models = [
+    "groq/llama-3.3-70b-versatile",
+    "cerebras/llama-3.3-70b",
+    "openrouter/meta-llama/llama-3.3-70b-instruct",
+    "ollama/llama3.2"
+]
+
+[[combos]]
+name = "coder"
+description = "DeepSeek official first, fallback to SambaNova Qwen, OpenRouter, then local Qwen"
+models = [
+    "deepseek/deepseek-chat",
+    "sambanova/Qwen2.5-Coder-32B-Instruct",
+    "openrouter/deepseek/deepseek-chat",
+    "ollama/qwen2.5-coder:7b"
+]
+
+# ============================================================================
+# Role Assignments (Orchestration roles, e.g. for Vibe Assembly)
+# ============================================================================
+
+[roles.boss]
+model = "tokenharbor/claude-sonnet-5"
+class = "flagship"
+context_window = 200000
+
+[roles.code]
+model = "coder"
+class = "coder"
+context_window = 65536
+recommended_ticket_size = "S"
+
+[roles.debug]
+model = "deepseek/deepseek-reasoner"
+class = "reasoner"
+
+[roles.chat]
+model = "fast-cheap"
+class = "fast"
+
+# ============================================================================
+# Error Classification Rules (Evaluated top-to-bottom, first match wins)
+# ============================================================================
+
+[[error_rules]]
+match = { Text = "rate limit" }
+fallback = true
+backoff = true
+
+[[error_rules]]
+match = { Text = "too many requests" }
+fallback = true
+backoff = true
+
+[[error_rules]]
+match = { Text = "quota exceeded" }
+fallback = true
+backoff = true
+
+[[error_rules]]
+match = { Text = "overloaded" }
+fallback = true
+backoff = true
+
+[[error_rules]]
+match = { Text = "capacity" }
+fallback = true
+backoff = true
+
+[[error_rules]]
+match = { Status = 401 }
+fallback = true
+cooldown_ms = 120000
+
+[[error_rules]]
+match = { Status = 403 }
+fallback = true
+cooldown_ms = 120000
+
+[[error_rules]]
+match = { Status = 429 }
+fallback = true
+backoff = true
+
+[[error_rules]]
+match = { Status = 503 }
+fallback = true
+cooldown_ms = 5000
+
+[[error_rules]]
+match = { Status = 502 }
+fallback = true
+cooldown_ms = 3000

@@ -1,0 +1,15 @@
+/target/
+*.db
+*.sqlite
+*.db-wal
+*.db-shm
+.env
+.env.*
+*.log
+.vibe_router_token
+*.vibe_router_token
+portable_data/
+
+# Reference and local analysis artifacts
+9router-master/
+graphify-out/
