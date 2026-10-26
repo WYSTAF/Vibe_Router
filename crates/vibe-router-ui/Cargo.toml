@@ -1,0 +1,12 @@
+[package]
+name = "vibe-router-ui"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85"
+description = "Static UI assets embedded into the binary at build time."
+license = "MIT"
+publish = false
+
+[dependencies]
+rust-embed = "8"
+mime_guess = "2"

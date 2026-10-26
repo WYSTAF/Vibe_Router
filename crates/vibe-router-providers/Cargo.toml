@@ -1,0 +1,32 @@
+[package]
+name = "vibe-router-providers"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85"
+description = "Registry that builds providers from config records; OpenAI-compatible transport."
+license = "MIT"
+publish = false
+
+[features]
+# Exposes the loopback mock upstream to the crate's own tests and to the
+# workspace integration tests without putting it in any shipped binary.
+test-mock = []
+
+[dependencies]
+vibe-router-core = { path = "../vibe-router-core" }
+vibe-router-config = { path = "../vibe-router-config" }
+vibe-router-translate = { path = "../vibe-router-translate" }
+
+reqwest = { version = "0.12", default-features = false, features = [
+    "json", "stream", "rustls-tls",
+] }
+tokio = { version = "1", default-features = false, features = ["sync", "time", "rt"] }
+async-trait = "0.1"
+parking_lot = "0.12"
+serde = { version = "1.0", features = ["derive"] }
+serde_json.workspace = true
+tracing = "0.1"
+futures-util = { version = "0.3", default-features = false }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "io-util", "net"] }

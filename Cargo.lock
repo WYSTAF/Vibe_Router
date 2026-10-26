@@ -1631,11 +1631,11 @@ checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
 name = "vibe-router"
 version = "0.1.0"
 dependencies = [
- "vr-cli",
+ "vibe-router-cli",
 ]
 
 [[package]]
-name = "vr-cache"
+name = "vibe-router-cache"
 version = "0.1.0"
 dependencies = [
  "parking_lot",
@@ -1644,11 +1644,11 @@ dependencies = [
  "sha2",
  "tokio",
  "tracing",
- "vr-core",
+ "vibe-router-core",
 ]
 
 [[package]]
-name = "vr-cli"
+name = "vibe-router-cli"
 version = "0.1.0"
 dependencies = [
  "anyhow",
@@ -1658,16 +1658,16 @@ dependencies = [
  "tokio",
  "tracing",
  "tracing-subscriber",
- "vr-config",
- "vr-core",
- "vr-health",
- "vr-providers",
- "vr-server",
- "vr-storage",
+ "vibe-router-config",
+ "vibe-router-core",
+ "vibe-router-health",
+ "vibe-router-providers",
+ "vibe-router-server",
+ "vibe-router-storage",
 ]
 
 [[package]]
-name = "vr-config"
+name = "vibe-router-config"
 version = "0.1.0"
 dependencies = [
  "parking_lot",
@@ -1677,11 +1677,11 @@ dependencies = [
  "tokio",
  "toml",
  "tracing",
- "vr-core",
+ "vibe-router-core",
 ]
 
 [[package]]
-name = "vr-core"
+name = "vibe-router-core"
 version = "0.1.0"
 dependencies = [
  "async-trait",
@@ -1691,18 +1691,18 @@ dependencies = [
 ]
 
 [[package]]
-name = "vr-health"
+name = "vibe-router-health"
 version = "0.1.0"
 dependencies = [
  "parking_lot",
  "serde",
  "tokio",
  "tracing",
- "vr-core",
+ "vibe-router-core",
 ]
 
 [[package]]
-name = "vr-providers"
+name = "vibe-router-providers"
 version = "0.1.0"
 dependencies = [
  "async-trait",
@@ -1713,13 +1713,13 @@ dependencies = [
  "serde_json",
  "tokio",
  "tracing",
- "vr-config",
- "vr-core",
- "vr-translate",
+ "vibe-router-config",
+ "vibe-router-core",
+ "vibe-router-translate",
 ]
 
 [[package]]
-name = "vr-routing"
+name = "vibe-router-routing"
 version = "0.1.0"
 dependencies = [
  "async-trait",
@@ -1727,12 +1727,12 @@ dependencies = [
  "serde_json",
  "tokio",
  "tracing",
- "vr-core",
- "vr-health",
+ "vibe-router-core",
+ "vibe-router-health",
 ]
 
 [[package]]
-name = "vr-server"
+name = "vibe-router-server"
 version = "0.1.0"
 dependencies = [
  "axum",
@@ -1743,19 +1743,19 @@ dependencies = [
  "serde_json",
  "tokio",
  "tracing",
- "vr-cache",
- "vr-config",
- "vr-core",
- "vr-health",
- "vr-providers",
- "vr-routing",
- "vr-storage",
- "vr-translate",
- "vr-ui",
+ "vibe-router-cache",
+ "vibe-router-config",
+ "vibe-router-core",
+ "vibe-router-health",
+ "vibe-router-providers",
+ "vibe-router-routing",
+ "vibe-router-storage",
+ "vibe-router-translate",
+ "vibe-router-ui",
 ]
 
 [[package]]
-name = "vr-storage"
+name = "vibe-router-storage"
 version = "0.1.0"
 dependencies = [
  "async-trait",
@@ -1766,11 +1766,11 @@ dependencies = [
  "thiserror 1.0.69",
  "tokio",
  "tracing",
- "vr-core",
+ "vibe-router-core",
 ]
 
 [[package]]
-name = "vr-translate"
+name = "vibe-router-translate"
 version = "0.1.0"
 dependencies = [
  "bytes",
@@ -1778,11 +1778,11 @@ dependencies = [
  "serde_json",
  "tokio",
  "tracing",
- "vr-core",
+ "vibe-router-core",
 ]
 
 [[package]]
-name = "vr-ui"
+name = "vibe-router-ui"
 version = "0.1.0"
 dependencies = [
  "mime_guess",

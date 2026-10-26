@@ -1,0 +1,19 @@
+[package]
+name = "vibe-router-cache"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85"
+description = "In-memory LRU prompt and response cache for Vibe Router."
+license = "MIT"
+publish = false
+
+[dependencies]
+vibe-router-core = { path = "../vibe-router-core" }
+serde = { version = "1", features = ["derive"] }
+serde_json.workspace = true
+parking_lot = "0.12"
+sha2 = "0.11"
+tracing = "0.1"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "time"] }

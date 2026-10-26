@@ -1,0 +1,16 @@
+[package]
+name = "vibe-router-health"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85"
+description = "Availability state: cooldowns, rate-limit windows, backoff levels."
+license = "MIT"
+publish = false
+
+[dependencies]
+vibe-router-core = { path = "../vibe-router-core" }
+
+tokio = { version = "1", default-features = false, features = ["sync", "time"] }
+parking_lot = "0.12"
+tracing = "0.1"
+serde = { version = "1.0", features = ["derive"] }

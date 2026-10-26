@@ -1,0 +1,396 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="dark">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Vibe Router</title>
+  <link rel="icon" type="image/png" href="logo.png">
+  <link rel="stylesheet" href="app.css">
+</head>
+<body>
+<header>
+  <div class="brand">
+    <img src="logo.png" alt="Vibe Router Logo" class="logo">
+    <h1>Vibe Router</h1>
+  </div>
+  <nav>
+    <button class="tab active" data-page="status">Status</button>
+    <button class="tab" data-page="assignment">Roles</button>
+    <button class="tab" data-page="providers">Providers</button>
+    <button class="tab" data-page="combos">Combos</button>
+    <button class="tab" data-page="aliases">Aliases</button>
+    <button class="tab" data-page="proxies">Proxies & Relay</button>
+    <button class="tab" data-page="costs">Costs & Latency</button>
+    <button class="tab" data-page="usage">Usage</button>
+  </nav>
+  <div class="header-right">
+    <span id="endpoint" class="mono header-endpoint"></span>
+    <button id="theme-toggle" class="btn-theme" title="Toggle Light / Dark mode" aria-label="Toggle theme">
+      <span class="theme-icon">☼</span>
+    </button>
+  </div>
+</header>
+
+<main>
+  <!-- STATUS PAGE -->
+  <section id="page-status" class="page">
+    <div class="section-head">
+      <h2>System Status</h2>
+      <button class="btn-refresh" id="btn-refresh-status" title="Refresh metrics">⟳ Refresh</button>
+    </div>
+    <div class="cards">
+      <div class="card">
+        <span class="label">Total Requests</span>
+        <span id="stat-requests" class="value">0</span>
+      </div>
+      <div class="card">
+        <span class="label">Succeeded</span>
+        <span id="stat-ok" class="value ok">0</span>
+      </div>
+      <div class="card">
+        <span class="label">Failed</span>
+        <span id="stat-fail" class="value err">0</span>
+      </div>
+      <div class="card">
+        <span class="label">Client Auth</span>
+        <span id="stat-auth" class="value">n/a</span>
+      </div>
+    </div>
+
+    <!-- USD Cost & Latency Card (p50/p95/p99) + Circuit Breakers -->
+    <div class="token-counter-card cost-card">
+      <div class="token-counter-header">
+        <span class="label-accent">USD Cost & Latency (p50/p95/p99)</span>
+        <span class="badge ok" id="circuit-summary-badge">Circuits Healthy</span>
+      </div>
+      <div class="cards">
+        <div class="card">
+          <span class="label">Total Spend</span>
+          <span id="stat-total-spend" class="value ok">$0.0000</span>
+        </div>
+        <div class="card">
+          <span class="label">Average Latency</span>
+          <span id="stat-avg-latency" class="value">0 ms</span>
+        </div>
+        <div class="card">
+          <span class="label">p50 / p95 / p99 Latency</span>
+          <span id="stat-percentiles" class="value font-sm">0 / 0 / 0 ms</span>
+        </div>
+      </div>
+    </div>
+
+    <!-- Live Token Counter Card separating reported vs estimated -->
+    <div class="token-counter-card">
+      <div class="token-counter-header">
+        <span class="label-accent">Live Token Accounting</span>
+        <span class="badge" id="token-ratio-badge">0% estimated</span>
+      </div>
+      <div class="token-grid">
+        <div class="token-col">
+          <span class="token-label">Provider-Reported Tokens</span>
+          <div class="token-stat">
+            <span class="token-sub">Prompt: <b id="stat-tokens-prompt">0</b></span>
+            <span class="token-sub">Completion: <b id="stat-tokens-completion">0</b></span>
+          </div>
+          <span class="token-total" id="stat-tokens-reported-total">0 total reported</span>
+        </div>
+        <div class="token-divider"></div>
+        <div class="token-col estimated-col">
+          <span class="token-label">Router-Estimated Tokens</span>
+          <div class="token-stat">
+            <span class="token-sub">Requests with ~estimate: <b id="stat-estimated-rows">0</b></span>
+          </div>
+          <span class="token-hint" id="stat-estimated-hint">Accurately tagged with ~ to prevent billing confusion.</span>
+        </div>
+      </div>
+    </div>
+
+    <!-- LRU Prompt Cache metrics -->
+    <div class="token-counter-card cache-card">
+      <div class="token-counter-header">
+        <span class="label-accent">LRU Prompt & Stream Cache</span>
+        <span class="badge" id="cache-badge">0 hits / 0 misses</span>
+      </div>
+      <div class="cards">
+        <div class="card">
+          <span class="label">Cache Hit Rate</span>
+          <span id="stat-cache-rate" class="value ok">0%</span>
+        </div>
+        <div class="card">
+          <span class="label">Cached Prompts & Streams</span>
+          <span id="stat-cache-count" class="value">0</span>
+        </div>
+        <div class="card">
+          <span class="label">Memory Used</span>
+          <span id="stat-cache-mem" class="value">0 MB</span>
+        </div>
+      </div>
+    </div>
+
+    <!-- Live Roles Assignment Banner Preview -->
+    <div class="section-head" style="margin-top: 28px;">
+      <h2>Active Orchestration Roles</h2>
+      <a href="#assignment" class="tab-link" data-page="assignment">Full View →</a>
+    </div>
+    <div id="roles-preview-grid" class="roles-grid mini-roles"></div>
+  </section>
+
+  <!-- ROLES / ASSIGNMENT PAGE -->
+  <section id="page-assignment" class="page" hidden>
+    <div class="section-head">
+      <h2>Vibe Assembly Role Assignments</h2>
+      <div class="head-actions">
+        <span id="assignment-refreshed" class="mono muted font-xs"></span>
+        <span id="assignment-offline-badge" class="badge">Online Active</span>
+      </div>
+    </div>
+    <p class="section-desc">
+      Live allocation served on <code>GET /v1/assignment</code>. Matches orchestration tickets to ready models with health-aware failover.
+    </p>
+
+    <div class="roles-grid" id="roles-full-grid"></div>
+  </section>
+
+  <!-- PROVIDERS PAGE -->
+  <section id="page-providers" class="page" hidden>
+    <div class="section-head">
+      <h2>Configured Providers</h2>
+      <span class="badge" id="providers-count">0 providers</span>
+    </div>
+    <table>
+      <thead>
+        <tr>
+          <th>Provider ID</th>
+          <th>Base URL</th>
+          <th>Models</th>
+          <th>Origin</th>
+          <th class="health">Health & Circuit</th>
+        </tr>
+      </thead>
+      <tbody id="provider-rows"></tbody>
+    </table>
+    <p id="provider-note" class="muted" hidden>
+      No providers configured. Define providers in <code>vibe-router.toml</code> or add them via <code>POST /api/providers</code>.
+    </p>
+  </section>
+
+  <!-- COMBOS PAGE -->
+  <section id="page-combos" class="page" hidden>
+    <div class="section-head">
+      <h2>Fallback Combos</h2>
+      <span class="badge" id="combos-count">0 combos</span>
+    </div>
+    <div id="combo-list"></div>
+
+    <!-- Quick Combo Editor & Tester -->
+    <div class="editor-grid">
+      <details id="combo-editor" class="editor-box" open>
+        <summary><b>+ Create / Update Combo</b></summary>
+        <div class="form-body">
+          <label>Combo Name
+            <input id="combo-name" placeholder="e.g. fast-coder or VIBE_ROUTER_Sonnet">
+          </label>
+          <label>Description (optional)
+            <input id="combo-desc" placeholder="Primary model then cheap fallback">
+          </label>
+          <label>Fallback Chain (comma-separated <code>provider/model</code>)
+            <input id="combo-models" type="text" list="model-list" placeholder="groq/llama-3.3-70b-versatile, ollama/llama3.2">
+          </label>
+          <datalist id="model-list"></datalist>
+          <button id="combo-save" class="btn-primary">Save Combo</button>
+          <span id="combo-message" class="msg-inline"></span>
+        </div>
+      </details>
+
+      <!-- Interactive Playground Tester -->
+      <div class="tester-box">
+        <h3>Interactive Model / Combo Tester</h3>
+        <label>Target Model, Combo, or Alias
+          <input id="test-model" placeholder="gpt-4o, fast-cheap, or groq/llama-3.3-70b-versatile">
+        </label>
+        <label>Prompt
+          <input id="test-prompt" value="Say 'Vibe Router active' in 5 words.">
+        </label>
+        <div class="tester-actions">
+          <button id="btn-run-test" class="btn-primary">Test Request</button>
+          <span id="test-status" class="mono muted font-xs"></span>
+        </div>
+        <div id="test-output-box" class="test-output mono" hidden></div>
+      </div>
+    </div>
+  </section>
+
+  <!-- VIRTUAL ALIASES PAGE -->
+  <section id="page-aliases" class="page" hidden>
+    <div class="section-head">
+      <h2>Virtual Model Aliases</h2>
+      <span class="badge" id="aliases-count">0 aliases</span>
+    </div>
+    <p class="section-desc">
+      Transparently map any client model name (e.g. <code>gpt-4o</code>, <code>claude-3-7-sonnet</code>) to underlying combos, fallback chains, or specific models before dispatch.
+    </p>
+    <table>
+      <thead>
+        <tr>
+          <th>Virtual Alias</th>
+          <th>Target Destination</th>
+          <th class="right">Action</th>
+        </tr>
+      </thead>
+      <tbody id="alias-rows"></tbody>
+    </table>
+    <p id="alias-note" class="muted" hidden>No virtual aliases configured yet.</p>
+
+    <div class="editor-box" style="margin-top: 24px;">
+      <h3>+ Register / Update Virtual Alias</h3>
+      <div class="form-body">
+        <label>Alias Name
+          <input id="alias-name" placeholder="e.g. gpt-4o or claude-3-7-sonnet">
+        </label>
+        <label>Target Destination (Combo or Provider/Model)
+          <input id="alias-target" placeholder="e.g. fast-chain or groq/llama-3.3-70b-versatile">
+        </label>
+        <button id="alias-save" class="btn-primary">Save Alias</button>
+        <span id="alias-message" class="msg-inline"></span>
+      </div>
+    </div>
+  </section>
+
+  <!-- PROXIES & CF WORKER RELAY PAGE -->
+  <section id="page-proxies" class="page" hidden>
+    <div class="section-head">
+      <h2>Smart Proxies & Cloudflare Worker Relay</h2>
+      <span class="badge" id="proxies-count">0 proxies</span>
+    </div>
+    <p class="section-desc">
+      Solves upstream mass-banning via deterministic sticky IP affinity: <code>proxy_index = fnv1a(api_key) % matching_pool.len()</code>. Each key consistently routes through the same proxy instance.
+    </p>
+
+    <!-- Cloudflare Worker Relay Script Quick Deployment -->
+    <div class="token-counter-card" style="margin-bottom: 24px;">
+      <div class="token-counter-header">
+        <span class="label-accent">Cloudflare Worker Reverse-Proxy Relay</span>
+        <button id="btn-copy-worker-script" class="btn-primary font-xs">📋 Copy Cloudflare Worker Script</button>
+      </div>
+      <p class="font-xs muted" style="margin-top: 8px;">
+        Zero-dependency, edge-deployed relay that forwards streaming SSE and custom upstream targets cleanly without leaking server IPs.
+      </p>
+    </div>
+
+    <table>
+      <thead>
+        <tr>
+          <th>Proxy ID</th>
+          <th>Tier Tag</th>
+          <th>URL</th>
+          <th>Status</th>
+          <th class="right">Action</th>
+        </tr>
+      </thead>
+      <tbody id="proxy-rows"></tbody>
+    </table>
+    <p id="proxy-note" class="muted" hidden>No tagged proxies registered yet.</p>
+
+    <div class="editor-box" style="margin-top: 24px;">
+      <h3>+ Register Tagged Proxy</h3>
+      <div class="form-body">
+        <label>Proxy URL
+          <input id="proxy-url" placeholder="https://your-worker.subdomain.workers.dev">
+        </label>
+        <label>Tier Tag
+          <select id="proxy-tag">
+            <option value="cf-worker">cf-worker (Cloudflare Worker Edge)</option>
+            <option value="datacenter">datacenter (Dedicated DC Proxy)</option>
+            <option value="residential">residential (High-trust Residential IP)</option>
+            <option value="direct">direct (Direct Egress)</option>
+          </select>
+        </label>
+        <label>Custom ID (optional)
+          <input id="proxy-id" placeholder="e.g. cf-edge-01">
+        </label>
+        <button id="proxy-save" class="btn-primary">Add Proxy</button>
+        <span id="proxy-message" class="msg-inline"></span>
+      </div>
+    </div>
+  </section>
+
+  <!-- COSTS & LATENCY PAGE -->
+  <section id="page-costs" class="page" hidden>
+    <div class="section-head">
+      <h2>USD Cost & Latency Metrics</h2>
+      <button class="btn-refresh" id="btn-refresh-costs" title="Refresh metrics">⟳ Refresh</button>
+    </div>
+    <div class="cards" style="margin-bottom: 24px;">
+      <div class="card">
+        <span class="label">Total Spend (USD)</span>
+        <span id="costs-total-spend" class="value ok">$0.0000</span>
+      </div>
+      <div class="card">
+        <span class="label">Average Latency</span>
+        <span id="costs-avg-lat" class="value">0 ms</span>
+      </div>
+      <div class="card">
+        <span class="label">p50 Latency</span>
+        <span id="costs-p50" class="value">0 ms</span>
+      </div>
+      <div class="card">
+        <span class="label">p95 / p99 Latency</span>
+        <span id="costs-p95-p99" class="value font-sm">0 / 0 ms</span>
+      </div>
+    </div>
+
+    <h3>Spend by Provider</h3>
+    <table style="margin-bottom: 28px;">
+      <thead>
+        <tr>
+          <th>Provider</th>
+          <th>Requests</th>
+          <th>Prompt Tokens</th>
+          <th>Completion Tokens</th>
+          <th class="right">Cost (USD)</th>
+        </tr>
+      </thead>
+      <tbody id="costs-provider-rows"></tbody>
+    </table>
+
+    <h3>Spend by Model</h3>
+    <table>
+      <thead>
+        <tr>
+          <th>Model</th>
+          <th>Requests</th>
+          <th>Prompt Tokens</th>
+          <th>Completion Tokens</th>
+          <th class="right">Cost (USD)</th>
+        </tr>
+      </thead>
+      <tbody id="costs-model-rows"></tbody>
+    </table>
+  </section>
+
+  <!-- USAGE PAGE -->
+  <section id="page-usage" class="page" hidden>
+    <div class="section-head">
+      <h2>Recent Request Log</h2>
+      <span class="badge font-xs">Newest 50 requests</span>
+    </div>
+    <table>
+      <thead>
+        <tr>
+          <th>Time</th>
+          <th>Requested Model</th>
+          <th>Served By</th>
+          <th>Status</th>
+          <th class="right">Tokens (Prompt / Comp)</th>
+          <th class="right">Latency</th>
+        </tr>
+      </thead>
+      <tbody id="usage-rows"></tbody>
+    </table>
+    <p id="usage-note" class="muted" hidden>No requests recorded yet.</p>
+  </section>
+</main>
+
+<script src="app.js"></script>
+</body>
+</html>
