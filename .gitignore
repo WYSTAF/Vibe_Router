@@ -13,3 +13,4 @@ portable_data/
 # Reference and local analysis artifacts
 9router-master/
 graphify-out/
+*.zip
