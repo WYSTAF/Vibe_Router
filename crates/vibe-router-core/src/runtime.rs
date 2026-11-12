@@ -130,7 +130,12 @@ impl HardwareProfile {
     }
 }
 
-/// Detect total system RAM in Megabytes without unsafe code.
+/// Detect total physical system RAM in Megabytes without unsafe code.
+///
+/// Uses `sysinfo`, which calls the native API on each platform
+/// (`GlobalMemoryStatusEx` on Windows, `sysctl hw.memsize` on macOS,
+/// `/proc/meminfo` on Linux), so Windows reports actual RAM rather than a
+/// hardcoded guess. `VIBE_ROUTER_RAM_MB` overrides detection for testing.
 pub fn detect_ram_mb() -> u64 {
     if let Ok(v) = std::env::var("VIBE_ROUTER_RAM_MB") {
         if let Ok(mb) = v.parse::<u64>() {
@@ -138,6 +143,14 @@ pub fn detect_ram_mb() -> u64 {
         }
     }
 
+    let mut sys = sysinfo::System::new();
+    sys.refresh_memory();
+    let bytes = sys.total_memory();
+    if bytes > 0 {
+        return bytes / 1024 / 1024;
+    }
+
+    // Linux fallback if sysinfo could not read memory.
     #[cfg(target_os = "linux")]
     {
         if let Ok(content) = std::fs::read_to_string("/proc/meminfo") {
@@ -154,7 +167,7 @@ pub fn detect_ram_mb() -> u64 {
         }
     }
 
-    // Default: 8192 MB (8GB) for desktop/workstation environments
+    // Last-resort default for environments where detection is unavailable.
     8192
 }
 

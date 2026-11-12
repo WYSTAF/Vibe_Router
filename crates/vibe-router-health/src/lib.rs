@@ -54,6 +54,9 @@ pub struct CircuitBreaker {
     pub tripped_until: Option<Instant>,
     pub recovery_cooldown: Duration,
     pub last_latency_ms: Option<u64>,
+    /// True while a single HALF_OPEN canary probe is in flight. Only one probe
+    /// is allowed at a time so a recovering provider is not flooded.
+    pub half_open_probe: bool,
 }
 
 impl CircuitBreaker {
@@ -65,6 +68,7 @@ impl CircuitBreaker {
             tripped_until: None,
             recovery_cooldown,
             last_latency_ms: None,
+            half_open_probe: false,
         }
     }
 
@@ -82,7 +86,9 @@ impl CircuitBreaker {
     pub fn can_execute(&mut self) -> bool {
         match self.current_state() {
             CircuitState::Closed => true,
-            CircuitState::HalfOpen => true,
+            // A single canary at a time: once a probe is in flight, further
+            // requests step aside until it records an outcome.
+            CircuitState::HalfOpen => !self.half_open_probe,
             CircuitState::Open => false,
         }
     }
@@ -91,12 +97,14 @@ impl CircuitBreaker {
         self.consecutive_failures = 0;
         self.state = CircuitState::Closed;
         self.tripped_until = None;
+        self.half_open_probe = false;
         if let Some(lat) = latency_ms {
             self.last_latency_ms = Some(lat);
         }
     }
 
     pub fn record_failure(&mut self, is_5xx_or_timeout: bool) {
+        self.half_open_probe = false;
         if is_5xx_or_timeout {
             self.consecutive_failures = self.consecutive_failures.saturating_add(1);
             if self.consecutive_failures >= self.failure_threshold {
@@ -194,16 +202,23 @@ impl HealthState {
     /// Checks provider Circuit Breaker first; if OPEN, trips to Cooldown.
     pub fn reserve(&self, model: &str) -> Usability {
         let provider = provider_of(model);
+        let half_open;
         {
             let mut cg = self.circuits.write();
             let cb = cg.entry(provider.to_string()).or_insert_with(|| {
                 CircuitBreaker::new(self.circuit_threshold, self.circuit_cooldown)
             });
-            if !cb.can_execute() {
-                if let Some(until) = cb.tripped_until {
-                    return Usability::Cooldown(until);
+            match cb.current_state() {
+                CircuitState::Open => {
+                    return Usability::Cooldown(cb.tripped_until.unwrap_or_else(Instant::now));
                 }
+                CircuitState::HalfOpen if cb.half_open_probe => {
+                    // A canary is already probing; step aside until it records.
+                    return Usability::Cooldown(Instant::now());
+                }
+                _ => {}
             }
+            half_open = cb.state == CircuitState::HalfOpen;
         }
 
         let mut g = self.inner.write();
@@ -214,7 +229,18 @@ impl HealthState {
             }
             e.cooldown_until = None;
         }
-        e.rpm.reserve()
+        let usability = e.rpm.reserve();
+        drop(g);
+
+        // Admit exactly one HALF_OPEN canary: mark the probe in flight only
+        // when the slot was actually consumed.
+        if matches!(usability, Usability::Ready) && half_open {
+            let mut cg = self.circuits.write();
+            if let Some(cb) = cg.get_mut(provider) {
+                cb.half_open_probe = true;
+            }
+        }
+        usability
     }
 
     /// Non-consuming usability read (for `Retry-After` reporting).
@@ -512,6 +538,34 @@ mod tests {
         // On success, transitions back to CLOSED!
         h.record("beta/m", Outcome::Success);
         assert_eq!(h.circuit_state("beta"), CircuitState::Closed);
+    }
+
+    #[test]
+    fn half_open_admits_only_one_canary() {
+        let h = HealthState::with_circuit_breaker(
+            Duration::from_millis(20),
+            Duration::from_secs(60),
+            2,
+            Duration::from_millis(40),
+        );
+        h.record("p/m", Outcome::fallback(500));
+        h.record("p/m", Outcome::fallback(500));
+        assert_eq!(h.circuit_state("p"), CircuitState::Open);
+        std::thread::sleep(Duration::from_millis(60));
+        assert_eq!(h.circuit_state("p"), CircuitState::HalfOpen);
+
+        // First reserve admits the canary; a concurrent second is blocked.
+        assert!(h.reserve("p/m").is_ready());
+        assert!(!h.reserve("p/m").is_ready(), "only one canary at a time");
+        assert!(
+            !h.reserve("p/other").is_ready(),
+            "provider-wide single canary"
+        );
+
+        // The canary succeeds -> CLOSED, traffic flows again.
+        h.record("p/m", Outcome::Success);
+        assert_eq!(h.circuit_state("p"), CircuitState::Closed);
+        assert!(h.reserve("p/m").is_ready());
     }
 
     #[test]

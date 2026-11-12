@@ -7,12 +7,13 @@
 /// A request/response wire format.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub enum WireFormat {
-    /// OpenAI Chat Completions (`/v1/chat/completions`). The default and the
-    /// only format v0.1 translates.
+    /// OpenAI Chat Completions (`/v1/chat/completions`). The default.
     #[default]
     OpenAi,
-    // Reserved, deliberately unimplemented in v0.1:
-    //   AnthropicMessages,  // /v1/messages
+    /// Anthropic Messages (`/v1/messages`). The transport translates OpenAI-shaped
+    /// core traffic to/from this format for native Anthropic upstreams.
+    Anthropic,
+    // Reserved, deliberately unimplemented:
     //   OpenAiResponses,    // /v1/responses
     //   Gemini,             // /v1beta/models/*:generateContent
 }
@@ -21,6 +22,7 @@ impl WireFormat {
     pub fn as_str(&self) -> &'static str {
         match self {
             WireFormat::OpenAi => "openai",
+            WireFormat::Anthropic => "anthropic",
         }
     }
 }
@@ -37,6 +39,7 @@ impl std::str::FromStr for WireFormat {
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s.trim().to_ascii_lowercase().as_str() {
             "openai" | "openai-chat" | "chat" => Ok(WireFormat::OpenAi),
+            "anthropic" | "anthropic-messages" | "messages" | "claude" => Ok(WireFormat::Anthropic),
             other => Err(UnknownFormat(other.to_string())),
         }
     }
@@ -47,7 +50,11 @@ pub struct UnknownFormat(pub String);
 
 impl std::fmt::Display for UnknownFormat {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "unknown wire format: {} (expected `openai`)", self.0)
+        write!(
+            f,
+            "unknown wire format: {} (expected `openai` or `anthropic`)",
+            self.0
+        )
     }
 }
 

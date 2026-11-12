@@ -8,7 +8,9 @@ use std::collections::HashMap;
 
 use async_trait::async_trait;
 
-use crate::types::{Combo, CostBreakdown, Provider, Rates, UsageMetricsSummary, UsageRecord};
+use crate::types::{
+    Combo, CostBreakdown, Provider, ProxyRecord, Rates, UsageMetricsSummary, UsageRecord,
+};
 
 /// Storage failures, surfaced to callers with enough context to act on.
 #[derive(Debug, thiserror::Error)]
@@ -60,8 +62,16 @@ pub trait StorageBackend: Send + Sync {
     async fn save_alias(&self, alias: &str, target: &str) -> BackendResult<()>;
     async fn delete_alias(&self, alias: &str) -> BackendResult<bool>;
 
+    // -- proxies -----------------------------------------------------------
+    async fn get_proxies(&self) -> BackendResult<Vec<ProxyRecord>>;
+    async fn save_proxy(&self, proxy: &ProxyRecord) -> BackendResult<()>;
+    async fn delete_proxy(&self, id: &str) -> BackendResult<bool>;
+
     // -- usage -------------------------------------------------------------
-    async fn record_usage(&self, stat: &UsageRecord) -> BackendResult<()>;
+    /// Record one request exactly once, priced against the persisted rate
+    /// table. Returns the cost in micro-dollars that was stored, so the caller
+    /// can echo the same figure in telemetry headers.
+    async fn record_usage(&self, stat: &UsageRecord) -> BackendResult<u64>;
     async fn get_usage_metrics(&self) -> BackendResult<UsageMetricsSummary>;
 
     // -- cost --------------------------------------------------------------

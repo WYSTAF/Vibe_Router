@@ -13,9 +13,10 @@ use std::time::Duration;
 
 use vibe_router_config::schema::{AuthConfig, ComboConfig, ModelConfig, ProviderConfig};
 use vibe_router_config::AppConfig;
+use vibe_router_core::RuntimeProfile;
 use vibe_router_providers::mock::{MockUpstream, Reply};
 use vibe_router_server::{routes, state::AppState};
-use vibe_router_storage::{MemoryStore, StorageBackend};
+use vibe_router_storage::StorageBackend;
 
 // ---------------------------------------------------------------- fixtures
 
@@ -69,8 +70,13 @@ fn cached_cfg(good_url: &str, bad_url: &str) -> AppConfig {
 }
 
 async fn spawn_server(cfg: &AppConfig) -> (String, Arc<AppState>) {
-    let store: Arc<dyn vibe_router_storage::Store> = Arc::new(MemoryStore::default());
-    let state = Arc::new(AppState::build(cfg, store).expect("state builds"));
+    // Exercise the REAL unified store stack (single owner, single schema), in
+    // memory so tests stay hermetic. An isolated mock store here would hide
+    // double-write accounting bugs.
+    let mut cfg = cfg.clone();
+    cfg.storage.sqlite_path = String::new();
+    cfg.server.auto_discover_proxies = false; // keep tests hermetic (no host VPN probes)
+    let state = Arc::new(AppState::build(&cfg, None).await.expect("state builds"));
     let app = routes::router(state.clone());
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -516,6 +522,7 @@ async fn combo_editor_round_trip_via_api() {
     // Delete, and it stops resolving.
     let resp = client()
         .delete(format!("{base}/api/combos/ui-chain"))
+        .header("X-Vibe-Admin", "1")
         .send()
         .await
         .unwrap();
@@ -532,7 +539,11 @@ async fn combo_editor_round_trip_via_api() {
 #[tokio::test]
 async fn provider_editor_round_trip_via_api() {
     let mock = MockUpstream::json(200, "OK", OK_BODY).await;
-    let (base, _state) = spawn_server(&combo_cfg(&mock.url(), &mock.url())).await;
+    // Runtime-authored providers targeting the loopback mock require the
+    // explicit local-upstream opt-in (SSRF guard).
+    let mut cfg = combo_cfg(&mock.url(), &mock.url());
+    cfg.server.allow_local_upstreams = true;
+    let (base, _state) = spawn_server(&cfg).await;
 
     // Add new provider dynamically
     let resp = client()
@@ -579,6 +590,7 @@ async fn provider_editor_round_trip_via_api() {
     // Delete dynamic provider
     let resp = client()
         .delete(format!("{base}/api/providers/dynamic-ai"))
+        .header("X-Vibe-Admin", "1")
         .send()
         .await
         .unwrap();
@@ -1100,6 +1112,7 @@ async fn cache_stats_and_purge_endpoints() {
     // Purge drops everything.
     let r = c
         .post(format!("{base}/api/cache/purge"))
+        .header("X-Vibe-Admin", "1")
         .send()
         .await
         .unwrap();
@@ -1281,6 +1294,7 @@ async fn virtual_model_alias_routing_e2e() {
     // Clean up
     let del = c
         .delete(format!("{base}/api/aliases/gpt-4o"))
+        .header("X-Vibe-Admin", "1")
         .send()
         .await
         .unwrap();
@@ -1456,6 +1470,7 @@ async fn proxy_management_and_cf_worker_script_e2e() {
     // 4. Delete proxy via DELETE /api/proxies/:id
     let del_resp = c
         .delete(format!("{base}/api/proxies/cf-edge-east"))
+        .header("X-Vibe-Admin", "1")
         .send()
         .await
         .unwrap();
@@ -1824,4 +1839,485 @@ async fn canonical_vibe_router_telemetry_headers_e2e() {
     assert!(h.get("x-vibe-router-latency-ms").is_some());
     assert_eq!(h.get("x-vibe-router-cache").unwrap(), "MISS");
     assert_eq!(h.get("x-vibe-router-provider").unwrap(), "good");
+}
+
+// ============================================================================
+// Hardening regression tests (real unified store stack)
+// ============================================================================
+
+/// Bind a server on a specific on-disk storage path (for restart/portable tests).
+async fn spawn_server_at(
+    cfg: &AppConfig,
+    path: &str,
+    profile: Option<RuntimeProfile>,
+) -> (String, Arc<AppState>) {
+    let mut cfg = cfg.clone();
+    cfg.storage.sqlite_path = path.to_string();
+    cfg.server.auto_discover_proxies = false;
+    let state = Arc::new(AppState::build(&cfg, profile).await.expect("state builds"));
+    let app = routes::router(state.clone());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+    (format!("http://{addr}"), state)
+}
+
+fn temp_db_path(tag: &str) -> (String, std::path::PathBuf) {
+    let dir = std::env::temp_dir().join(format!("vr-e2e-{tag}-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    (dir.join("test.db").to_string_lossy().into_owned(), dir)
+}
+
+const TOOL_CALL_BODY: &str = r#"{"id":"c1","object":"chat.completion","model":"m","choices":[{"index":0,"message":{"role":"assistant","content":null,"tool_calls":[{"id":"call_1","type":"function","function":{"name":"get_weather","arguments":"{\"city\":\"Paris\"}"}}]},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":7,"completion_tokens":5}}"#;
+
+#[tokio::test]
+async fn single_write_accounting_non_stream_plus_stream() {
+    // One non-streaming + one streaming request must total exactly 2 rows in
+    // the unified store — never 4 (the old dual-writer bug).
+    let mock = MockUpstream::sequence(vec![
+        Reply::Json(200, OK_BODY.to_string()),
+        Reply::Sse {
+            chunks: sse_chunks(),
+            silence: None,
+        },
+    ])
+    .await;
+    let (base, _state) = spawn_server(&combo_cfg(&mock.url(), &mock.url())).await;
+    let c = client();
+
+    let r1 = c
+        .post(format!("{base}/v1/chat/completions"))
+        .json(&serde_json::json!({"model": "good/m", "messages": [{"role":"user","content":"a"}]}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r1.status(), 200);
+
+    let r2 = c
+        .post(format!("{base}/v1/chat/completions"))
+        .json(&serde_json::json!({"model": "good/m", "stream": true, "messages": [{"role":"user","content":"b"}]}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r2.status(), 200);
+    let _ = r2.bytes().await.unwrap(); // drain the stream so usage is recorded
+    tokio::time::sleep(Duration::from_millis(150)).await;
+
+    let status: serde_json::Value = c
+        .get(format!("{base}/api/status"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(
+        status["totals"]["requests"], 2,
+        "exactly one row per request"
+    );
+    let totals: serde_json::Value = c
+        .get(format!("{base}/api/usage/totals"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(totals["requests"], 2);
+}
+
+#[tokio::test]
+async fn api_auth_enforced_and_csrf_guarded() {
+    let mock = MockUpstream::json(200, "OK", OK_BODY).await;
+    let mut cfg = combo_cfg(&mock.url(), &mock.url());
+    cfg.server.api_keys = vec!["sk-admin".into()];
+    let (base, _state) = spawn_server(&cfg).await;
+    let c = client();
+
+    // No key -> 401 on admin and compat surfaces.
+    assert_eq!(
+        c.get(format!("{base}/api/status"))
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        401
+    );
+    assert_eq!(
+        c.get(format!("{base}/v1/models"))
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        401
+    );
+
+    // Valid key -> 200.
+    let ok = c
+        .get(format!("{base}/api/status"))
+        .bearer_auth("sk-admin")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(ok.status(), 200);
+
+    // Mutating request with key but no JSON content-type / admin header -> 415.
+    let no_csrf = c
+        .post(format!("{base}/api/cache/purge"))
+        .bearer_auth("sk-admin")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(no_csrf.status(), 415);
+
+    // With the admin header -> 200.
+    let with_hdr = c
+        .post(format!("{base}/api/cache/purge"))
+        .bearer_auth("sk-admin")
+        .header("X-Vibe-Admin", "1")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(with_hdr.status(), 200);
+}
+
+#[tokio::test]
+async fn runtime_secret_references_rejected_and_no_shadowing() {
+    let mock = MockUpstream::json(200, "OK", OK_BODY).await;
+    let mut cfg = combo_cfg(&mock.url(), &mock.url());
+    cfg.server.allow_local_upstreams = true;
+    let (base, _state) = spawn_server(&cfg).await;
+    let c = client();
+
+    let env_secret = c
+        .post(format!("{base}/api/providers"))
+        .json(&serde_json::json!({"id":"evil","base_url":mock.url(),"auth_secret":"env:SECRET"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(env_secret.status(), 400);
+
+    let file_key = c
+        .post(format!("{base}/api/providers"))
+        .json(&serde_json::json!({"id":"evil2","base_url":mock.url(),"api_keys":["file:/etc/passwd"]}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(file_key.status(), 400);
+
+    // Cannot shadow a config-file provider by id.
+    let shadow = c
+        .post(format!("{base}/api/providers"))
+        .json(&serde_json::json!({"id":"good","base_url":mock.url()}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(shadow.status(), 403);
+}
+
+#[tokio::test]
+async fn ssrf_guard_blocks_private_and_loopback_targets() {
+    let mock = MockUpstream::json(200, "OK", OK_BODY).await;
+    let (base, _state) = spawn_server(&combo_cfg(&mock.url(), &mock.url())).await;
+    let c = client();
+
+    for bad in [
+        "http://127.0.0.1:9/v1",
+        "http://169.254.169.254/latest",
+        "http://10.1.2.3/v1",
+        "http://192.168.0.1/v1",
+    ] {
+        let r = c
+            .post(format!("{base}/api/providers"))
+            .json(&serde_json::json!({"id":"p","base_url":bad}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status(), 400, "{bad} must be blocked");
+    }
+    // A public target is allowed.
+    let ok = c
+        .post(format!("{base}/api/providers"))
+        .json(&serde_json::json!({"id":"pub","base_url":"https://api.example.com/v1"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(ok.status(), 201);
+
+    // Proxy URLs are guarded too.
+    let bad_proxy = c
+        .post(format!("{base}/api/proxies"))
+        .json(&serde_json::json!({"id":"px","url":"http://172.16.0.1:8080","tag":"datacenter"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(bad_proxy.status(), 400);
+}
+
+#[tokio::test]
+async fn dashboard_serves_strict_csp() {
+    let mock = MockUpstream::json(200, "OK", OK_BODY).await;
+    let (base, _state) = spawn_server(&combo_cfg(&mock.url(), &mock.url())).await;
+    let resp = client().get(format!("{base}/")).send().await.unwrap();
+    let csp = resp
+        .headers()
+        .get("content-security-policy")
+        .unwrap()
+        .to_str()
+        .unwrap();
+    assert!(csp.contains("script-src 'self'"), "{csp}");
+    assert!(csp.contains("object-src 'none'"), "{csp}");
+}
+
+#[tokio::test]
+async fn anthropic_tool_use_roundtrip_non_streaming() {
+    let mut mock = MockUpstream::json(200, "OK", TOOL_CALL_BODY).await;
+    let (base, _state) = spawn_server(&combo_cfg(&mock.url(), &mock.url())).await;
+    let c = client();
+
+    // Turn 1: tools defined -> assistant tool_use block.
+    let resp: serde_json::Value = c
+        .post(format!("{base}/v1/messages"))
+        .json(&serde_json::json!({
+            "model": "good/m",
+            "max_tokens": 256,
+            "tools": [{"name":"get_weather","description":"w","input_schema":{"type":"object"}}],
+            "messages": [{"role":"user","content":[{"type":"text","text":"weather in Paris?"}]}]
+        }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(resp["stop_reason"], "tool_use");
+    assert_eq!(resp["content"][0]["type"], "tool_use");
+    assert_eq!(resp["content"][0]["name"], "get_weather");
+    assert_eq!(resp["content"][0]["input"]["city"], "Paris");
+
+    // The upstream request was translated to OpenAI tools shape.
+    let req0 = mock.request_text(0).await;
+    assert!(req0.contains("\"tools\""), "{req0}");
+
+    // Turn 2: assistant tool_use + user tool_result -> OpenAI tool_calls + role:tool.
+    let _resp2: serde_json::Value = c
+        .post(format!("{base}/v1/messages"))
+        .json(&serde_json::json!({
+            "model": "good/m",
+            "max_tokens": 256,
+            "messages": [
+                {"role":"user","content":[{"type":"text","text":"weather?"}]},
+                {"role":"assistant","content":[{"type":"tool_use","id":"call_1","name":"get_weather","input":{"city":"Paris"}}]},
+                {"role":"user","content":[{"type":"tool_result","tool_use_id":"call_1","content":[{"type":"text","text":"sunny"}]}]}
+            ]
+        }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let req1 = mock.request_text(1).await;
+    assert!(req1.contains("\"tool_calls\""), "{req1}");
+    assert!(req1.contains("\"role\":\"tool\""), "{req1}");
+}
+
+#[tokio::test]
+async fn anthropic_tool_use_streaming() {
+    let chunks = vec![
+        "data: {\"choices\":[{\"delta\":{\"role\":\"assistant\"},\"finish_reason\":null}]}\n\n".to_string(),
+        "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"function\":{\"name\":\"get_weather\",\"arguments\":\"{\\\"city\\\":\"}}]},\"finish_reason\":null}]}\n\n".to_string(),
+        "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"\\\"Paris\\\"}\"}}]},\"finish_reason\":null}]}\n\n".to_string(),
+        "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\n".to_string(),
+        "data: [DONE]\n\n".to_string(),
+    ];
+    let mock = MockUpstream::sse(chunks).await;
+    let (base, _state) = spawn_server(&combo_cfg(&mock.url(), &mock.url())).await;
+
+    let resp = client()
+        .post(format!("{base}/v1/messages"))
+        .json(&serde_json::json!({"model":"good/m","max_tokens":256,"stream":true,"messages":[{"role":"user","content":"weather?"}]}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let body = resp.text().await.unwrap();
+    assert!(
+        body.contains("content_block_start") && body.contains("tool_use"),
+        "{body}"
+    );
+    assert!(body.contains("input_json_delta"), "{body}");
+    assert!(body.contains("message_stop"), "{body}");
+    assert!(
+        body.contains("tool_use") && body.contains("stop_reason"),
+        "{body}"
+    );
+}
+
+#[tokio::test]
+async fn upstream_429_and_401_status_preserved() {
+    // 429 -> 429 with Retry-After (not masked as 503).
+    let mock429 = MockUpstream::json(
+        429,
+        "Too Many Requests",
+        r#"{"error":{"message":"rate limit exceeded"}}"#,
+    )
+    .await;
+    let (base, _s) = spawn_server(&combo_cfg(&mock429.url(), &mock429.url())).await;
+    let r = client()
+        .post(format!("{base}/v1/chat/completions"))
+        .json(&serde_json::json!({"model":"good/m","messages":[]}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 429);
+    assert!(
+        r.headers().get("retry-after").is_some(),
+        "Retry-After must be preserved"
+    );
+
+    // 401 -> 401 (account-scoped terminal status preserved).
+    let mock401 = MockUpstream::json(
+        401,
+        "Unauthorized",
+        r#"{"error":{"message":"invalid api key"}}"#,
+    )
+    .await;
+    let (base2, _s2) = spawn_server(&combo_cfg(&mock401.url(), &mock401.url())).await;
+    let r2 = client()
+        .post(format!("{base2}/v1/chat/completions"))
+        .json(&serde_json::json!({"model":"good/m","messages":[]}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r2.status(), 401);
+}
+
+#[tokio::test]
+async fn canonical_cache_key_differentiates_max_tokens() {
+    let mock = MockUpstream::json(200, "OK", OK_BODY).await;
+    let (base, _state) = spawn_server(&cached_cfg(&mock.url(), &mock.url())).await;
+    let c = client();
+    let msg = serde_json::json!([{"role":"user","content":"same prompt"}]);
+
+    for mt in [5, 2000] {
+        let r = c
+            .post(format!("{base}/v1/chat/completions"))
+            .json(&serde_json::json!({"model":"good/m","messages":msg,"max_tokens":mt}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status(), 200);
+    }
+    let stats: serde_json::Value = c
+        .get(format!("{base}/api/cache/stats"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(stats["misses"], 2, "max_tokens=5 vs 2000 must not collide");
+    assert_eq!(stats["hits"], 0);
+
+    // Repeating max_tokens=5 hits the cache.
+    let r = c
+        .post(format!("{base}/v1/chat/completions"))
+        .json(&serde_json::json!({"model":"good/m","messages":msg,"max_tokens":5}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.headers().get("x-vibe-router-cache").unwrap(), "HIT");
+}
+
+#[tokio::test]
+async fn alias_persists_across_restart() {
+    let mock = MockUpstream::json(200, "OK", OK_BODY).await;
+    let (path, dir) = temp_db_path("alias");
+    let cfg = combo_cfg(&mock.url(), &mock.url());
+    let (base, _state) = spawn_server_at(&cfg, &path, None).await;
+
+    let r = client()
+        .post(format!("{base}/api/aliases"))
+        .json(&serde_json::json!({"alias":"fast","target":"good/m"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 201);
+
+    // A fresh state on the same path loads the persisted alias at startup.
+    let mut cfg2 = cfg.clone();
+    cfg2.storage.sqlite_path = path.clone();
+    let state2 = AppState::build(&cfg2, None).await.unwrap();
+    use vibe_router_core::ModelRegistry;
+    assert!(
+        state2.registry.resolve("fast").is_ok(),
+        "alias must survive restart"
+    );
+    std::fs::remove_dir_all(dir).ok();
+}
+
+#[tokio::test]
+async fn portable_mode_zero_disk_writes_then_atomic_flush() {
+    let mock = MockUpstream::json(200, "OK", OK_BODY).await;
+    let (path, dir) = temp_db_path("portable");
+    let cfg = combo_cfg(&mock.url(), &mock.url());
+    let (base, state) = spawn_server_at(&cfg, &path, Some(RuntimeProfile::Portable)).await;
+    assert!(state.hardware_profile.memory_first_storage);
+
+    let r = client()
+        .post(format!("{base}/v1/chat/completions"))
+        .json(&serde_json::json!({"model":"good/m","messages":[{"role":"user","content":"hi"}]}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 200);
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    // Traffic stayed in RAM: no database file on disk yet.
+    assert!(
+        !std::path::Path::new(&path).exists(),
+        "portable mode must not write during traffic"
+    );
+
+    // Explicit snapshot flushes atomically and durably.
+    state.backend.sync_to_disk(&path).await.unwrap();
+    assert!(std::path::Path::new(&path).exists());
+    let reopened = vibe_router_storage::SqliteAsyncBackend::open(&path)
+        .await
+        .unwrap();
+    assert!(reopened.get_usage_metrics().await.unwrap().requests >= 1);
+    std::fs::remove_dir_all(dir).ok();
+}
+
+#[tokio::test]
+async fn cf_worker_proxy_relays_with_target_header() {
+    let mut mock = MockUpstream::json(200, "OK", OK_BODY).await;
+    let mut cfg = combo_cfg(&mock.url(), &mock.url());
+    cfg.server.allow_local_upstreams = true;
+    let (base, _state) = spawn_server(&cfg).await;
+    let c = client();
+
+    // Register the mock as a cf-worker reverse relay.
+    let r = c
+        .post(format!("{base}/api/proxies"))
+        .json(&serde_json::json!({"id":"cf","url":mock.url(),"tag":"cf-worker"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 201);
+
+    let resp = c
+        .post(format!("{base}/v1/chat/completions"))
+        .json(&serde_json::json!({"model":"good/m","messages":[{"role":"user","content":"via proxy"}]}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+
+    // The transport routed through the relay with an X-Target-URL header.
+    let req = mock.request_text(0).await;
+    assert!(req.to_ascii_lowercase().contains("x-target-url"), "{req}");
 }

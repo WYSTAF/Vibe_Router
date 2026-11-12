@@ -10,6 +10,9 @@ api_keys = []
 # Or read acceptable keys from environment variable names:
 # api_key_env = ["VIBE_ROUTER_API_KEY"]
 log_dir = "logs"
+# Allow runtime-authored providers/proxies to target loopback/private networks
+# (e.g. local Ollama or Vibe-Local). Default false blocks SSRF via the admin API.
+# allow_local_upstreams = true
 
 [storage]
 # SQLite database file for usage metrics and runtime-authored combos.
@@ -242,6 +245,8 @@ class = "fast"
 # ============================================================================
 # Error Classification Rules (Evaluated top-to-bottom, first match wins)
 # ============================================================================
+# Custom rules are merged ahead of the built-in defaults. Set
+# replace_default_error_rules = true (top level) to use only your own rules.
 
 [[error_rules]]
 match = { Text = "rate limit" }

@@ -111,6 +111,8 @@ pub enum EnvCommands {
         /// Base URL of the running Vibe Router server
         #[arg(long, default_value = "http://127.0.0.1:20128")]
         endpoint: String,
+        #[command(flatten)]
+        args: CommonArgs,
     },
 }
 
@@ -157,6 +159,13 @@ pub enum ProxyCommands {
     },
     /// List registered proxy endpoints
     List(CommonArgs),
+    /// Remove a registered proxy endpoint by id
+    Remove {
+        /// Proxy id to remove
+        id: String,
+        #[command(flatten)]
+        args: CommonArgs,
+    },
 }
 
 #[derive(Subcommand)]
@@ -287,12 +296,13 @@ pub fn run() -> Result<()> {
         Some(Commands::Proxy { command }) => match command {
             ProxyCommands::Add { url, tag, id, args } => cmd_proxy_add(url, tag, id, args),
             ProxyCommands::List(args) => cmd_proxy_list(args),
+            ProxyCommands::Remove { id, args } => cmd_proxy_remove(id, args),
         },
         Some(Commands::Relay { command }) => match command {
             RelayCommands::WorkerScript => cmd_relay_worker_script(),
         },
         Some(Commands::Env { command }) => match command {
-            EnvCommands::ClaudeCode { endpoint } => cmd_env_claude_code(endpoint),
+            EnvCommands::ClaudeCode { endpoint, args } => cmd_env_claude_code(endpoint, args),
         },
         Some(Commands::Tui(args)) => cmd_tui(args),
         Some(Commands::Mcp(args)) => cmd_mcp(args),
@@ -367,11 +377,9 @@ fn cmd_serve(args: ServeArgs) -> Result<()> {
         .context("Failed to build Tokio runtime")?;
 
     rt.block_on(async move {
-        let store = vibe_router_storage::open(&cfg.storage.sqlite_path)
-            .with_context(|| format!("Failed to open storage at {}", cfg.storage.sqlite_path))?;
-
         let state = Arc::new(
-            AppState::build(&cfg, store)
+            AppState::build(&cfg, profile_override)
+                .await
                 .map_err(|e| anyhow::anyhow!("{e}"))?
                 .with_config_path(config_path.clone()),
         );
@@ -387,7 +395,7 @@ fn cmd_serve(args: ServeArgs) -> Result<()> {
         println!("│ Claude:    http://{bound}/v1/messages               │");
         println!("│ Dashboard: http://{bound}/                          │");
         if state.auth.lock().enabled() {
-            println!("│ Auth:      API Key required (.vibe_router_token synced)  │");
+            println!("│ Auth:      API Key required                              │");
         } else {
             println!("│ Auth:      Open (no API key required)                    │");
         }
@@ -412,15 +420,78 @@ fn cmd_serve(args: ServeArgs) -> Result<()> {
         println!("└──────────────────────────────────────────────────────────┘");
         println!("Press Ctrl+C to stop.");
 
-        // Wait forever or until shutdown signal
-        tokio::signal::ctrl_c()
-            .await
-            .context("Failed to listen for ctrl-c")?;
+        // RAM-first portable mode: periodically snapshot dirty in-memory state
+        // back to disk so a crash loses at most one interval of writes, while
+        // normal traffic never touches the flash.
+        let portable = state.hardware_profile.memory_first_storage
+            && !cfg.storage.sqlite_path.trim().is_empty()
+            && cfg.storage.sqlite_path != ":memory:";
+        if portable {
+            let snap_state = state.clone();
+            let snap_path = cfg.storage.sqlite_path.clone();
+            tokio::spawn(async move {
+                let mut tick = tokio::time::interval(std::time::Duration::from_secs(60));
+                tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                loop {
+                    tick.tick().await;
+                    if snap_state.sqlite.is_dirty() {
+                        if let Err(e) = snap_state.backend.sync_to_disk(&snap_path).await {
+                            tracing::warn!("periodic portable snapshot failed: {e}");
+                        }
+                    }
+                }
+            });
+        }
+
+        // Hot reload: watch the config file's mtime and swap the router/auth/
+        // registry on change. In-flight requests finish on their old snapshot;
+        // health and storage are preserved. A parse/validation failure keeps
+        // the previous config rather than breaking the running server.
+        if let Some(path) = config_path.clone() {
+            let reload_state = state.clone();
+            tokio::spawn(async move {
+                let mut last = std::fs::metadata(&path).and_then(|m| m.modified()).ok();
+                let mut tick = tokio::time::interval(std::time::Duration::from_secs(2));
+                tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                loop {
+                    tick.tick().await;
+                    let modified = std::fs::metadata(&path).and_then(|m| m.modified()).ok();
+                    if modified == last {
+                        continue;
+                    }
+                    last = modified;
+                    match vibe_router_config::AppConfig::load(&path) {
+                        Ok(fresh) => match reload_state.swap_config(&fresh) {
+                            Ok(_) => tracing::info!("config hot-reloaded from {path}"),
+                            Err(e) => tracing::warn!("config reload rejected: {e}"),
+                        },
+                        Err(e) => tracing::warn!("config reload parse failed: {e}"),
+                    }
+                }
+            });
+        }
+
+        // Proactive health maintenance: advance circuit-breaker state machines
+        // (OPEN -> HALF_OPEN) on a timer so recovery does not depend on the next
+        // request arriving, and surface circuit state in the logs.
+        {
+            let health_state = state.clone();
+            tokio::spawn(async move {
+                let mut tick = tokio::time::interval(std::time::Duration::from_secs(15));
+                tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                loop {
+                    tick.tick().await;
+                    let _ = health_state.health.circuit_snapshots();
+                }
+            });
+        }
+
+        // Wait for SIGINT (Ctrl-C) or SIGTERM, then drain and flush.
+        shutdown_signal().await;
         tracing::info!("Shutdown signal received, draining in-flight requests...");
 
-        // If in RAM-first portable mode, flush final snapshot back to disk
-        if state.hardware_profile.memory_first_storage && cfg.storage.sqlite_path != ":memory:" {
-            tracing::info!("Syncing in-memory SQLite state to USB storage...");
+        if portable {
+            tracing::info!("Syncing in-memory SQLite state to disk...");
             if let Err(e) = state.backend.sync_to_disk(&cfg.storage.sqlite_path).await {
                 tracing::warn!("Failed to flush final snapshot to disk: {e}");
             }
@@ -430,6 +501,33 @@ fn cmd_serve(args: ServeArgs) -> Result<()> {
 
         Ok::<(), anyhow::Error>(())
     })
+}
+
+/// Resolve when the process is asked to stop: Ctrl-C on every platform, plus
+/// SIGTERM on Unix so container/service managers trigger the same clean flush.
+async fn shutdown_signal() {
+    let ctrl_c = async {
+        let _ = tokio::signal::ctrl_c().await;
+    };
+    #[cfg(unix)]
+    {
+        let mut term =
+            match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+                Ok(s) => s,
+                Err(_) => {
+                    ctrl_c.await;
+                    return;
+                }
+            };
+        tokio::select! {
+            _ = ctrl_c => {},
+            _ = term.recv() => {},
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        ctrl_c.await;
+    }
 }
 
 fn cmd_config_validate(args: CommonArgs) -> Result<()> {
@@ -793,6 +891,24 @@ fn runtime_provider_from_config(
 
 /// The cache is per-process, so the CLI reaches the *running* server's cache
 /// over its admin API rather than opening a second, empty one.
+/// Resolve a configured admin key (literal first, then env reference) so CLI
+/// commands can authenticate against the protected `/api` surface. The value
+/// is used internally and never printed.
+fn configured_admin_key() -> Option<String> {
+    let cfg = load_config_or_default(std::path::Path::new(DEFAULT_CONFIG)).ok()?;
+    if let Some(k) = cfg.server.api_keys.iter().find(|k| !k.trim().is_empty()) {
+        return Some(k.clone());
+    }
+    for name in &cfg.server.api_key_env {
+        if let Ok(v) = std::env::var(name) {
+            if !v.trim().is_empty() {
+                return Some(v);
+            }
+        }
+    }
+    None
+}
+
 fn cmd_cache_purge(endpoint: String) -> Result<()> {
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -800,8 +916,13 @@ fn cmd_cache_purge(endpoint: String) -> Result<()> {
         .context("Failed to start runtime")?;
     rt.block_on(async {
         let url = format!("{}/api/cache/purge", endpoint.trim_end_matches('/'));
-        let resp = reqwest::Client::new()
+        let mut req = reqwest::Client::new()
             .post(&url)
+            .header("X-Vibe-Admin", "1");
+        if let Some(key) = configured_admin_key() {
+            req = req.bearer_auth(key);
+        }
+        let resp = req
             .send()
             .await
             .with_context(|| format!("cannot reach Vibe Router at {endpoint}"))?;
@@ -820,8 +941,11 @@ fn cmd_cache_stats(endpoint: String, json: bool) -> Result<()> {
         .context("Failed to start runtime")?;
     rt.block_on(async {
         let url = format!("{}/api/cache/stats", endpoint.trim_end_matches('/'));
-        let resp = reqwest::Client::new()
-            .get(&url)
+        let mut req = reqwest::Client::new().get(&url).header("X-Vibe-Admin", "1");
+        if let Some(key) = configured_admin_key() {
+            req = req.bearer_auth(key);
+        }
+        let resp = req
             .send()
             .await
             .with_context(|| format!("cannot reach Vibe Router at {endpoint}"))?;
@@ -951,6 +1075,13 @@ fn cmd_costs(args: CommonArgs) -> Result<()> {
 
 fn cmd_alias_set(alias: String, target: String, args: CommonArgs) -> Result<()> {
     let cfg = load_config_or_default(&args.config)?;
+    // Validate the target resolves against the configured providers/combos so
+    // a typo fails here, not at request time.
+    let registry = vibe_router_providers::Registry::from_config(&cfg);
+    use vibe_router_core::ModelRegistry;
+    if registry.resolve(&target).is_err() {
+        anyhow::bail!("alias target `{target}` does not resolve to a known model or combo");
+    }
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()?;
@@ -992,12 +1123,7 @@ fn cmd_alias_list(args: CommonArgs) -> Result<()> {
     })
 }
 
-fn cmd_proxy_add(
-    url: String,
-    tag_str: String,
-    id: Option<String>,
-    _args: CommonArgs,
-) -> Result<()> {
+fn cmd_proxy_add(url: String, tag_str: String, id: Option<String>, args: CommonArgs) -> Result<()> {
     let tag: vibe_router_providers::ProxyTag =
         tag_str.parse().map_err(|e| anyhow::anyhow!("{e}"))?;
     let proxy_id = id.unwrap_or_else(|| {
@@ -1005,28 +1131,72 @@ fn cmd_proxy_add(
             .trim_start_matches("http://")
             .replace(['/', ':', '.'], "-")
     });
-    println!("✓ Added proxy `{proxy_id}` [{tag}] -> `{url}`");
-    Ok(())
+    let cfg = load_config_or_default(&args.config)?;
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?;
+    rt.block_on(async {
+        let backend =
+            vibe_router_storage::SqliteAsyncBackend::open(&cfg.storage.sqlite_path).await?;
+        let record = vibe_router_storage::ProxyRecord {
+            id: proxy_id.clone(),
+            url: url.clone(),
+            tag: tag.to_string(),
+            enabled: true,
+            weight: 1,
+        };
+        backend.save_proxy(&record).await?;
+        println!("✓ Added proxy `{proxy_id}` [{tag}] -> `{url}`");
+        println!(
+            "  Persisted to {}. Restart the server to load it.",
+            cfg.storage.sqlite_path
+        );
+        Ok(())
+    })
 }
 
 fn cmd_proxy_list(args: CommonArgs) -> Result<()> {
-    let pool = vibe_router_providers::ProxyPool::new();
-    let proxies = pool.list();
-    if args.json {
-        println!("{}", serde_json::to_string_pretty(&proxies)?);
-        return Ok(());
-    }
-    if proxies.is_empty() {
-        println!("No proxies registered in static pool.");
-        println!("(Add proxies via `vibe-router proxy add <URL> --tag <TAG>`)");
-        return Ok(());
-    }
-    println!("{:<20} {:<14} URL", "ID", "TAG");
-    println!("{}", "-".repeat(60));
-    for p in proxies {
-        println!("{:<20} {:<14} {}", p.id, p.tag, p.url);
-    }
-    Ok(())
+    let cfg = load_config_or_default(&args.config)?;
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?;
+    rt.block_on(async {
+        let backend =
+            vibe_router_storage::SqliteAsyncBackend::open(&cfg.storage.sqlite_path).await?;
+        let proxies = backend.get_proxies().await?;
+        if args.json {
+            println!("{}", serde_json::to_string_pretty(&proxies)?);
+            return Ok(());
+        }
+        if proxies.is_empty() {
+            println!("No proxies registered in {}", cfg.storage.sqlite_path);
+            println!("(Add proxies via `vibe-router proxy add <URL> --tag <TAG>`)");
+            return Ok(());
+        }
+        println!("{:<20} {:<14} URL", "ID", "TAG");
+        println!("{}", "-".repeat(60));
+        for p in proxies {
+            println!("{:<20} {:<14} {}", p.id, p.tag, p.url);
+        }
+        Ok(())
+    })
+}
+
+fn cmd_proxy_remove(id: String, args: CommonArgs) -> Result<()> {
+    let cfg = load_config_or_default(&args.config)?;
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?;
+    rt.block_on(async {
+        let backend =
+            vibe_router_storage::SqliteAsyncBackend::open(&cfg.storage.sqlite_path).await?;
+        if backend.delete_proxy(&id).await? {
+            println!("✓ Removed proxy `{id}`");
+        } else {
+            println!("No proxy `{id}` found in {}", cfg.storage.sqlite_path);
+        }
+        Ok(())
+    })
 }
 
 fn cmd_relay_worker_script() -> Result<()> {
@@ -1034,16 +1204,43 @@ fn cmd_relay_worker_script() -> Result<()> {
     Ok(())
 }
 
-fn cmd_env_claude_code(endpoint: String) -> Result<()> {
+fn cmd_env_claude_code(endpoint: String, args: CommonArgs) -> Result<()> {
+    let cfg = load_config_or_default(&args.config)?;
     let clean_endpoint = endpoint.trim_end_matches('/');
+    let auth = vibe_router_server::Auth::from_config(&cfg).map_err(|e| anyhow::anyhow!("{e}"))?;
+
+    // Emit a key expression that actually authenticates. Never echo a literal
+    // secret: reference the configured env var, or instruct the operator to
+    // substitute their configured key. Open mode accepts any placeholder.
+    let (bash_key, ps_key, note) = if !auth.enabled() {
+        (
+            "vibe-router".to_string(),
+            "vibe-router".to_string(),
+            "Server is open (no API key required); any value works.",
+        )
+    } else if let Some(envname) = cfg.server.api_key_env.first() {
+        (
+            format!("${envname}"),
+            format!("$env:{envname}"),
+            "Using the configured server.api_key_env reference.",
+        )
+    } else {
+        (
+            "<your-configured-api-key>".to_string(),
+            "<your-configured-api-key>".to_string(),
+            "Server requires a key: substitute a configured server.api_keys value (not printed here).",
+        )
+    };
+
     println!("# Vibe Router Environment for Claude Code");
+    println!("# {note}");
     println!("# Run these commands in your shell before starting `claude`:\n");
     println!("# Bash / Zsh");
     println!("export ANTHROPIC_BASE_URL=\"{clean_endpoint}\"");
-    println!("export ANTHROPIC_API_KEY=\"vibe-router\"\n");
+    println!("export ANTHROPIC_API_KEY=\"{bash_key}\"\n");
     println!("# Windows PowerShell");
     println!("$env:ANTHROPIC_BASE_URL = \"{clean_endpoint}\"");
-    println!("$env:ANTHROPIC_API_KEY = \"vibe-router\"");
+    println!("$env:ANTHROPIC_API_KEY = \"{ps_key}\"");
     Ok(())
 }
 
@@ -1376,7 +1573,26 @@ async fn execute_mcp_tool(
             if url.is_empty() {
                 "Error: `url` parameter is required".to_string()
             } else {
-                format!("Success: proxy `{url}` [{tag}] registered")
+                let id = arguments
+                    .get("id")
+                    .and_then(serde_json::Value::as_str)
+                    .map(|s| s.to_string())
+                    .unwrap_or_else(|| {
+                        url.trim_start_matches("https://")
+                            .trim_start_matches("http://")
+                            .replace(['/', ':', '.'], "-")
+                    });
+                let record = vibe_router_storage::ProxyRecord {
+                    id: id.clone(),
+                    url: url.to_string(),
+                    tag: tag.to_string(),
+                    enabled: true,
+                    weight: 1,
+                };
+                match backend.save_proxy(&record).await {
+                    Ok(_) => format!("Success: proxy `{id}` [{tag}] -> `{url}` persisted"),
+                    Err(e) => format!("Error saving proxy: {e}"),
+                }
             }
         }
         _ => format!("Unknown tool: {tool_name}"),

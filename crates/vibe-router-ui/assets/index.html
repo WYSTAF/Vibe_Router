@@ -25,6 +25,11 @@
   </nav>
   <div class="header-right">
     <span id="endpoint" class="mono header-endpoint"></span>
+    <span id="api-key-bar" class="api-key-bar" hidden>
+      <input id="api-key-input" type="password" placeholder="Admin API key" autocomplete="off" aria-label="Admin API key">
+      <button id="api-key-save" class="btn-primary font-xs">Unlock</button>
+    </span>
+    <span id="api-key-status" class="badge" hidden></span>
     <button id="theme-toggle" class="btn-theme" title="Toggle Light / Dark mode" aria-label="Toggle theme">
       <span class="theme-icon">☼</span>
     </button>

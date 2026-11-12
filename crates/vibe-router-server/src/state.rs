@@ -1,10 +1,14 @@
 //! Server state: the wired-up stack.
 //!
 //! This is the *only* place in the binary that names concrete implementations:
-//! the registry from `vibe-router-providers`, the classifier from `vibe-router-config`, the
-//! HTTP transport, the health state and the store all meet here and nowhere
+//! the registry from `vibe-router-providers`, the classifier from `vibe-router-config`,
+//! the HTTP transport, the health state and the store all meet here and nowhere
 //! else. Routing stays generic, which is what keeps the dependency arrows
 //! pointing one way.
+//!
+//! Storage is a single owner: one [`SqliteStore`] serves both the synchronous
+//! request-path `Store` view and the async `StorageBackend` view, so every
+//! request is recorded exactly once against one schema.
 //!
 //! A config reload swaps an `Arc<AppRouter>` inside an `RwLock`. In-flight
 //! requests hold their own clone of the Arc and finish on the old snapshot,
@@ -12,15 +16,17 @@
 //! windows) and the usage store survive reloads — they are facts about the
 //! world, not about the config file.
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
 use parking_lot::{Mutex, RwLock};
 use vibe_router_config::{AppConfig, ConfigClassifier};
+use vibe_router_core::{HardwareProfile, RuntimeProfile};
 use vibe_router_health::HealthState;
-use vibe_router_providers::{HttpUpstream, Registry};
+use vibe_router_providers::{HttpUpstream, ProxyEntry, ProxyTag, Registry};
 use vibe_router_routing::{Policy, Router};
-use vibe_router_storage::{RuntimeCombo, Store};
+use vibe_router_storage::{ProxyRecord, SqliteStore, StorageBackend, Store, UsageRecord};
 
 /// The monomorphized router for this binary.
 pub type AppRouter = Router<Registry, HealthState, ConfigClassifier, HttpUpstream>;
@@ -33,8 +39,12 @@ pub struct AppState {
     /// updates both views at once.
     pub registry: Arc<Registry>,
     pub health: Arc<HealthState>,
+    /// Synchronous request-path view of the one storage owner.
     pub store: Arc<dyn Store>,
-    pub backend: Arc<dyn vibe_router_storage::StorageBackend>,
+    /// Async view of the *same* storage owner.
+    pub backend: Arc<dyn StorageBackend>,
+    /// The concrete single owner, for snapshot/flush and path access.
+    pub sqlite: Arc<SqliteStore>,
     /// Auth may be re-resolved from a reloaded config.
     pub auth: Mutex<Auth>,
     /// `host:port` the server is (or will be) bound to, for display.
@@ -49,7 +59,10 @@ pub struct AppState {
     /// Whether streaming responses may be cached (`[cache] stream_cache = true`).
     pub stream_cache_enabled: bool,
     /// Hardware profile and runtime mode (VPS, Portable, Workstation).
-    pub hardware_profile: vibe_router_core::HardwareProfile,
+    pub hardware_profile: HardwareProfile,
+    /// When false (default), runtime-authored providers/proxies may not target
+    /// loopback, link-local, or private networks (SSRF guard).
+    pub allow_local_upstreams: AtomicBool,
 }
 
 /// Client-facing API key checking.
@@ -63,7 +76,8 @@ pub enum Auth {
 impl Auth {
     /// Resolve configured keys plus any `api_key_env` names into the active
     /// set. A named-but-missing env var is a startup error rather than a
-    /// silent hole in the auth check.
+    /// silent hole in the auth check. Only explicitly configured sources are
+    /// accepted — no implicit environment variables, no token-file fallback.
     pub fn from_config(cfg: &AppConfig) -> Result<Self, String> {
         let mut keys: Vec<String> = cfg
             .server
@@ -84,16 +98,6 @@ impl Auth {
             }
         }
 
-        // Vibe-Link zero-401 handshake: check shared environment variables
-        for env_key in &["VIBE_ROUTER_TOKEN", "VIBE_ROUTER_API_KEY"] {
-            if let Ok(v) = std::env::var(env_key) {
-                let trimmed = v.trim();
-                if !trimmed.is_empty() && !keys.contains(&trimmed.to_string()) {
-                    keys.push(trimmed.to_string());
-                }
-            }
-        }
-
         Ok(if keys.is_empty() {
             Auth::Open
         } else {
@@ -105,7 +109,7 @@ impl Auth {
         matches!(self, Auth::Keys(_))
     }
 
-    /// Constant-time check against configured keys or shared `.vibe_router_token`.
+    /// Constant-time check against configured keys.
     pub fn verify(&self, presented: Option<&str>) -> bool {
         let Auth::Keys(keys) = self else {
             return true; // open mode
@@ -117,15 +121,6 @@ impl Auth {
         for key in keys {
             if ct_eq(key.as_bytes(), presented.as_bytes()) {
                 matched = true;
-            }
-        }
-        if !matched {
-            // Check shared .vibe_router_token file for local tool handshake
-            if let Ok(token) = std::fs::read_to_string(".vibe_router_token") {
-                let trimmed = token.trim();
-                if !trimmed.is_empty() && ct_eq(trimmed.as_bytes(), presented.as_bytes()) {
-                    matched = true;
-                }
             }
         }
         matched
@@ -144,19 +139,37 @@ fn ct_eq(a: &[u8], b: &[u8]) -> bool {
 }
 
 impl AppState {
-    /// Build the whole stack from a loaded config.
-    pub fn build(cfg: &AppConfig, store: Arc<dyn Store>) -> Result<Self, String> {
+    /// Build the whole stack from a loaded config, honoring an optional runtime
+    /// profile override (the CLI `--profile` flag). Storage is constructed here
+    /// as a single owner so the sync and async views never diverge.
+    pub async fn build(
+        cfg: &AppConfig,
+        profile_override: Option<RuntimeProfile>,
+    ) -> Result<Self, String> {
         let auth = Auth::from_config(cfg)?;
+        let hardware_profile = HardwareProfile::detect(profile_override);
         let health = Arc::new(HealthState::new(
             Duration::from_millis(cfg.limits.cooldown.transient_ms),
             Duration::from_millis(cfg.limits.cooldown.max_ms),
         ));
         apply_rate_limits(&health, cfg);
         let registry = Arc::new(Registry::from_config(cfg));
-        // Restore runtime combos persisted by a previous run so the UI's
-        // editor survives restarts (they are runtime state, not file state).
-        let persisted: Vec<RuntimeCombo> = store.list_combos().unwrap_or_default();
-        for rc in persisted {
+
+        // One storage owner. Portable mode hydrates into RAM once; everything
+        // else is disk-backed (or in-memory when no path is configured).
+        let path = cfg.storage.sqlite_path.trim();
+        let sqlite = if path.is_empty() {
+            Arc::new(SqliteStore::open_sync(":memory:").map_err(|e| e.to_string())?)
+        } else if hardware_profile.memory_first_storage {
+            Arc::new(SqliteStore::open_portable(path).map_err(|e| e.to_string())?)
+        } else {
+            Arc::new(SqliteStore::open_sync(path).map_err(|e| e.to_string())?)
+        };
+        let store: Arc<dyn Store> = sqlite.clone();
+        let backend: Arc<dyn StorageBackend> = sqlite.clone();
+
+        // Restore runtime-authored state so the dashboard survives restarts.
+        for rc in store.list_combos().unwrap_or_default() {
             registry.set_runtime_combo(vibe_router_core::Combo {
                 name: rc.name,
                 description: rc.description,
@@ -164,33 +177,19 @@ impl AppState {
                 strategy: Default::default(),
             });
         }
-        // Restore runtime providers persisted by a previous run.
-        let persisted_providers = store.list_providers().unwrap_or_default();
-        for rp in persisted_providers {
+        for rp in store.list_providers().unwrap_or_default() {
             let p_cfg = provider_from_runtime(&rp);
             registry.set_runtime_provider(vibe_router_providers::build_provider(&p_cfg));
         }
-        let hardware_profile = vibe_router_core::HardwareProfile::detect(None);
-        registry.proxies().auto_discover_local_proxies();
-
-        let backend_path = if cfg.storage.sqlite_path.trim().is_empty() {
-            ":memory:"
-        } else {
-            cfg.storage.sqlite_path.as_str()
-        };
-
-        let backend: Arc<dyn vibe_router_storage::StorageBackend> =
-            if hardware_profile.memory_first_storage && backend_path != ":memory:" {
-                Arc::new(
-                    vibe_router_storage::SqliteAsyncBackend::open_portable(backend_path)
-                        .map_err(|e| e.to_string())?,
-                )
-            } else {
-                Arc::new(
-                    vibe_router_storage::SqliteAsyncBackend::open_sync(backend_path)
-                        .map_err(|e| e.to_string())?,
-                )
-            };
+        for (alias, target) in backend.get_aliases().await.unwrap_or_default() {
+            registry.set_alias(alias, target);
+        }
+        for pr in backend.get_proxies().await.unwrap_or_default() {
+            registry.proxies().add(proxy_entry_from_record(&pr));
+        }
+        if cfg.server.auto_discover_proxies {
+            registry.proxies().auto_discover_local_proxies();
+        }
 
         let router = Arc::new(build_router(cfg, registry.clone(), health.clone()));
 
@@ -199,22 +198,10 @@ impl AppState {
         } else {
             hardware_profile.cache_capacity_mb
         };
-
         let cache = Arc::new(vibe_router_cache::PromptCache::new(
             cache_mb * 1024 * 1024,
             Duration::from_secs(cfg.cache.ttl_seconds),
         ));
-
-        if auth.enabled() {
-            let token_path = std::path::Path::new(".vibe_router_token");
-            if !token_path.exists() {
-                if let Auth::Keys(keys) = &auth {
-                    if let Some(first) = keys.first() {
-                        let _ = std::fs::write(token_path, first);
-                    }
-                }
-            }
-        }
 
         Ok(Self {
             router: RwLock::new(router),
@@ -222,6 +209,7 @@ impl AppState {
             health,
             store,
             backend,
+            sqlite,
             auth: Mutex::new(auth),
             bind_addr: cfg.bind_addr(),
             config_path: None,
@@ -230,12 +218,8 @@ impl AppState {
             cache_enabled: cfg.cache.enabled,
             stream_cache_enabled: cfg.cache.stream_cache,
             hardware_profile,
+            allow_local_upstreams: AtomicBool::new(cfg.server.allow_local_upstreams),
         })
-    }
-
-    pub fn with_backend(mut self, backend: Arc<dyn vibe_router_storage::StorageBackend>) -> Self {
-        self.backend = backend;
-        self
     }
 
     pub fn with_config_path(mut self, path: Option<String>) -> Self {
@@ -247,6 +231,16 @@ impl AppState {
         self.router.read().clone()
     }
 
+    pub fn allow_local_upstreams(&self) -> bool {
+        self.allow_local_upstreams.load(Ordering::Relaxed)
+    }
+
+    /// Record one request exactly once, priced by the storage owner. Returns
+    /// the stored cost in micro-dollars for telemetry headers.
+    pub async fn record_usage(&self, rec: UsageRecord) -> u64 {
+        self.backend.record_usage(&rec).await.unwrap_or(0)
+    }
+
     /// Rebuild from fresh config: auth re-resolved, rate limits re-applied,
     /// registry reloaded in place (the transport and router both point at
     /// that one Arc), then the router swapped so classifier rules and policy
@@ -255,6 +249,8 @@ impl AppState {
         *self.auth.lock() = Auth::from_config(cfg)?;
         apply_rate_limits(&self.health, cfg);
         *self.roles.write() = cfg.roles.clone();
+        self.allow_local_upstreams
+            .store(cfg.server.allow_local_upstreams, Ordering::Relaxed);
         self.registry.reload(cfg);
         let router = Arc::new(build_router(
             cfg,
@@ -263,6 +259,28 @@ impl AppState {
         ));
         *self.router.write() = router;
         Ok(())
+    }
+}
+
+/// Convert a persisted proxy record into a live pool entry.
+pub fn proxy_entry_from_record(pr: &ProxyRecord) -> ProxyEntry {
+    ProxyEntry {
+        id: pr.id.clone(),
+        url: pr.url.clone(),
+        tag: pr.tag.parse::<ProxyTag>().unwrap_or(ProxyTag::Direct),
+        enabled: pr.enabled,
+        weight: pr.weight.max(1),
+    }
+}
+
+/// Convert a live pool entry into a persistable record.
+pub fn proxy_record_from_entry(p: &ProxyEntry) -> ProxyRecord {
+    ProxyRecord {
+        id: p.id.clone(),
+        url: p.url.clone(),
+        tag: p.tag.to_string(),
+        enabled: p.enabled,
+        weight: p.weight.max(1),
     }
 }
 
@@ -429,18 +447,36 @@ mod tests {
         assert!(!auth.enabled());
     }
 
+    #[test]
+    fn implicit_env_token_is_not_accepted() {
+        // A stray VIBE_ROUTER_TOKEN in the environment must NOT grant access
+        // unless explicitly referenced via api_key_env.
+        std::env::set_var("VIBE_ROUTER_TOKEN", "stray-token");
+        let auth = Auth::from_config(&cfg()).unwrap();
+        assert!(!auth.enabled());
+        std::env::remove_var("VIBE_ROUTER_TOKEN");
+    }
+
     #[tokio::test]
     async fn build_restores_persisted_runtime_combos() {
-        // A store holding a combo from a "previous run".
-        let store: Arc<dyn Store> = Arc::new(vibe_router_storage::MemoryStore::default());
-        store
-            .upsert_combo(&RuntimeCombo {
+        // Seed a combo through the unified store, then build state on the same
+        // in-memory owner shape (a fresh path) and confirm restoration works
+        // via a disk round-trip.
+        let dir = std::env::temp_dir().join(format!("vr-state-restore-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("state.db");
+        {
+            use vibe_router_storage::ComboStore;
+            let seed = SqliteStore::open_sync(&path).unwrap();
+            seed.upsert_combo(&vibe_router_storage::RuntimeCombo {
                 name: "restored".into(),
                 description: None,
                 models: vec!["a/x".into()],
             })
             .unwrap();
+        }
         let mut c = cfg();
+        c.storage.sqlite_path = path.to_string_lossy().into_owned();
         c.providers = vec![vibe_router_config::schema::ProviderConfig {
             id: "a".into(),
             display_name: None,
@@ -459,10 +495,10 @@ mod tests {
             passthrough: false,
         }];
         c.router.providers = c.providers.clone();
-        let state = AppState::build(&c, store).unwrap();
+        let state = AppState::build(&c, None).await.unwrap();
         assert!(state.registry.combo("restored").is_some());
-        // And it resolves.
         use vibe_router_core::ModelRegistry;
         assert!(state.registry.resolve("restored").is_ok());
+        std::fs::remove_dir_all(dir).ok();
     }
 }

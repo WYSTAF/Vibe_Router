@@ -308,7 +308,11 @@ pub fn build_provider(p: &ProviderConfig) -> ConfigProvider {
         display_name: p.display_name.clone().unwrap_or_else(|| p.id.clone()),
         transport: vibe_router_core::Transport {
             base_url: p.base_url.clone(),
-            format: vibe_router_core::WireFormat::OpenAi, // v0.1: only one format exists
+            format: p
+                .format
+                .0
+                .parse::<vibe_router_core::WireFormat>()
+                .unwrap_or_default(),
             headers: p.headers.clone(),
         },
         auth,
@@ -462,6 +466,7 @@ mod tests {
                 error_rules: vec![],
                 roles: None,
                 cache: Default::default(),
+                replace_default_error_rules: false,
             },
             source_path: None,
         }

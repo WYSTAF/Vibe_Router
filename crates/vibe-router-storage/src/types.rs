@@ -181,6 +181,34 @@ pub struct UsageRecord {
     /// Vibe Assembly role (`boss`, `code`, `debug`, `judge`, `chat`, `hermes`).
     #[serde(default)]
     pub role: Option<String>,
+    /// True when this row was served from the prompt cache (no upstream call,
+    /// zero cost). Kept distinct from a reported zero-usage upstream response.
+    #[serde(default)]
+    pub cached: bool,
+}
+
+/// A tagged proxy persisted in storage.
+///
+/// Storage owns its own record shape so it never depends on the providers
+/// crate; the server converts to/from `vibe_router_providers::ProxyEntry`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProxyRecord {
+    pub id: String,
+    pub url: String,
+    /// Tier tag: `cf-worker`, `datacenter`, `residential`, `direct`.
+    pub tag: String,
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    #[serde(default = "default_weight")]
+    pub weight: u32,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+fn default_weight() -> u32 {
+    1
 }
 
 impl Default for UsageRecord {
@@ -200,6 +228,7 @@ impl Default for UsageRecord {
             cost_micros: 0,
             ts: now_secs(),
             role: None,
+            cached: false,
         }
     }
 }

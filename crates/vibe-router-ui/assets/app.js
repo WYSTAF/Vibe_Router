@@ -1,7 +1,86 @@
 // Vibe Router Web Dashboard — Vanilla JS, zero dependencies.
 // Talks directly to /v1/* and /api/* endpoints.
+//
+// Security: every dynamic value is inserted with textContent / createElement
+// (never innerHTML interpolation), and every request carries the session admin
+// key as `Authorization: Bearer <key>`. The key lives in sessionStorage only.
 
 const $ = (id) => document.getElementById(id);
+
+// ---------------------------------------------------------------- SAFE DOM
+
+function el(tag, cls, text) {
+  const n = document.createElement(tag);
+  if (cls) n.className = cls;
+  if (text != null) n.textContent = String(text);
+  return n;
+}
+
+function badge(text, cls, title) {
+  const b = el("span", "badge" + (cls ? " " + cls : ""), text);
+  if (title) b.title = title;
+  return b;
+}
+
+function td(cls, content) {
+  const c = el("td", cls);
+  if (content == null) return c;
+  if (typeof content === "string" || typeof content === "number") {
+    c.textContent = String(content);
+  } else if (Array.isArray(content)) {
+    for (const node of content) if (node) c.appendChild(node);
+  } else {
+    c.appendChild(content);
+  }
+  return c;
+}
+
+// ---------------------------------------------------------------- ADMIN KEY
+
+const KEY_STORAGE = "vibe_router_admin_key";
+let adminKey = sessionStorage.getItem(KEY_STORAGE) || "";
+
+function authHeaders() {
+  // X-Vibe-Admin marks a deliberate admin call so bodyless DELETEs pass the
+  // server's CSRF check (a cross-site simple request cannot set this header).
+  const h = { "X-Vibe-Admin": "1" };
+  if (adminKey) h.Authorization = "Bearer " + adminKey;
+  return h;
+}
+
+function showKeyBar(locked) {
+  const bar = $("api-key-bar");
+  const status = $("api-key-status");
+  if (locked) {
+    bar.hidden = false;
+    status.hidden = false;
+    status.textContent = "Locked";
+    status.className = "badge err";
+  } else if (adminKey) {
+    bar.hidden = true;
+    status.hidden = false;
+    status.textContent = "Unlocked";
+    status.className = "badge ok";
+  } else {
+    bar.hidden = true;
+    status.hidden = true;
+  }
+}
+
+function initKeyUI() {
+  showKeyBar(false);
+  $("api-key-save")?.addEventListener("click", () => {
+    adminKey = $("api-key-input").value.trim();
+    if (adminKey) sessionStorage.setItem(KEY_STORAGE, adminKey);
+    else sessionStorage.removeItem(KEY_STORAGE);
+    $("api-key-input").value = "";
+    showKeyBar(false);
+    loadStatus();
+  });
+  $("api-key-input")?.addEventListener("keydown", (e) => {
+    if (e.key === "Enter") $("api-key-save").click();
+  });
+}
 
 // ---------------------------------------------------------------- THEME
 
@@ -10,8 +89,7 @@ const THEME_KEY = "vibe_router_theme";
 function initTheme() {
   const saved = localStorage.getItem(THEME_KEY) || localStorage.getItem("vr_theme");
   const preferred = window.matchMedia("(prefers-color-scheme: light)").matches ? "light" : "dark";
-  const theme = saved || preferred;
-  applyTheme(theme);
+  applyTheme(saved || preferred);
 
   $("theme-toggle").addEventListener("click", () => {
     const cur = document.documentElement.getAttribute("data-theme") || "dark";
@@ -24,9 +102,7 @@ function initTheme() {
 function applyTheme(theme) {
   document.documentElement.setAttribute("data-theme", theme);
   const icon = $("theme-toggle").querySelector(".theme-icon");
-  if (icon) {
-    icon.textContent = theme === "dark" ? "☼" : "☾";
-  }
+  if (icon) icon.textContent = theme === "dark" ? "☼" : "☾";
 }
 
 // ---------------------------------------------------------------- NAVIGATION
@@ -61,7 +137,12 @@ function showPage(name) {
 // ---------------------------------------------------------------- API
 
 async function api(path, opts = {}) {
-  const resp = await fetch(path, opts);
+  const headers = { ...(opts.headers || {}), ...authHeaders() };
+  const resp = await fetch(path, { ...opts, headers });
+  if (resp.status === 401) {
+    showKeyBar(true);
+    throw new Error("Authentication required — enter the admin API key.");
+  }
   if (!resp.ok) {
     let detail = "";
     try {
@@ -72,6 +153,12 @@ async function api(path, opts = {}) {
     throw new Error(detail || resp.status);
   }
   return resp.status === 204 ? null : resp.json();
+}
+
+// Raw fetch that still carries the admin key (playground, relay script).
+function authFetch(path, opts = {}) {
+  const headers = { ...(opts.headers || {}), ...authHeaders() };
+  return fetch(path, { ...opts, headers });
 }
 
 function fmtTokens(n) {
@@ -110,7 +197,6 @@ async function loadStatus() {
     $("stat-fail").textContent = fmtTokens(totals.failed);
     $("stat-auth").textContent = statusData.auth_required ? "API Key Required" : "Open";
 
-    // Reported vs Estimated breakdown
     const prompt = totals.prompt_tokens || 0;
     const comp = totals.completion_tokens || 0;
     const totalReported = prompt + comp;
@@ -126,7 +212,6 @@ async function loadStatus() {
     ratioBadge.textContent = `${ratio}% estimated`;
     ratioBadge.className = `badge ${ratio > 25 ? "warn" : ratio === 0 ? "ok" : ""}`;
 
-    // USD Cost & Latency metrics (p50/p95/p99)
     if (costsData && costsData.metrics) {
       const m = costsData.metrics;
       const totalMicros = costsData.breakdown?.total_micros || 0;
@@ -135,7 +220,6 @@ async function loadStatus() {
       $("stat-percentiles").textContent = `${m.p50_latency_ms || 0} / ${m.p95_latency_ms || 0} / ${m.p99_latency_ms || 0} ms`;
     }
 
-    // Circuit Breaker health summary
     if (healthData && healthData.circuits) {
       const openCount = healthData.circuits.filter((c) => c.state === "open").length;
       const circuitBadge = $("circuit-summary-badge");
@@ -148,7 +232,6 @@ async function loadStatus() {
       }
     }
 
-    // Cache metrics (Prompt & Stream cache)
     const cache = statusData.cache || {};
     const cacheHits = cache.hits || 0;
     const cacheMisses = cache.misses || 0;
@@ -156,14 +239,10 @@ async function loadStatus() {
     $("stat-cache-rate").textContent = `${cacheRate}%`;
     const cachedTotal = (cache.cached_prompts || 0) + (cache.cached_streams || 0);
     $("stat-cache-count").textContent = fmtTokens(cachedTotal);
-    $("stat-cache-mem").textContent = `${(
-      (cache.memory_bytes || 0) / 1_048_576
-    ).toFixed(1)} MB`;
+    $("stat-cache-mem").textContent = `${((cache.memory_bytes || 0) / 1_048_576).toFixed(1)} MB`;
     const cacheBadge = $("cache-badge");
     cacheBadge.textContent = `${cacheHits} hits / ${cacheMisses} misses`;
-    cacheBadge.className = `badge ${
-      cacheHits > 0 && cacheHits > cacheMisses ? "ok" : ""
-    }`;
+    cacheBadge.className = `badge ${cacheHits > 0 && cacheHits > cacheMisses ? "ok" : ""}`;
 
     loadAssignmentPreview();
   } catch (e) {
@@ -174,46 +253,37 @@ async function loadStatus() {
 // ---------------------------------------------------------------- ROLES / ASSIGNMENT
 
 function renderRoleCard(roleKey, roleData) {
+  const card = el("div", `role-card role-${roleKey}`);
+
+  const header = el("div", "role-header");
+  header.appendChild(el("span", "role-title", roleKey));
   const status = roleData.status || "ready";
-  const statusBadge =
-    status === "ready"
-      ? '<span class="badge ok">ready</span>'
-      : status === "cooling"
-        ? '<span class="badge cooling">cooling</span>'
-        : status === "rate_limited"
-          ? '<span class="badge rate_limited">rate limited</span>'
-          : `<span class="badge">${status}</span>`;
+  const statusCls =
+    status === "ready" ? "ok" : status === "cooling" ? "cooling" : status === "rate_limited" ? "rate_limited" : "";
+  header.appendChild(badge(status === "rate_limited" ? "rate limited" : status, statusCls));
+  card.appendChild(header);
 
-  const isVr = roleData.model.startsWith("VIBE_ROUTER_") || roleData.model.startsWith("VR_");
-  const modelHtml = isVr
-    ? `<span class="badge badge-vibe-router-combo">${roleData.model}</span>`
-    : `<span class="role-model">${roleData.model}</span>`;
+  const modelWrap = el("div");
+  const model = String(roleData.model || "");
+  const isVr = model.startsWith("VIBE_ROUTER_") || model.startsWith("VR_");
+  modelWrap.appendChild(el("span", isVr ? "badge badge-vibe-router-combo" : "role-model", model));
+  card.appendChild(modelWrap);
 
-  const ctxHtml = roleData.context_window
-    ? `<span class="role-class-badge">${fmtTokens(roleData.context_window)} ctx</span>`
-    : "";
+  const meta = el("div", "role-meta");
+  meta.appendChild(badge(roleData.class || "generic", "role-class-badge"));
+  if (roleData.context_window) {
+    meta.appendChild(badge(`${fmtTokens(roleData.context_window)} ctx`, "role-class-badge"));
+  }
+  if (roleData.recommended_ticket_size) {
+    meta.appendChild(badge(`Ticket ${roleData.recommended_ticket_size}`, "role-class-badge"));
+  }
+  card.appendChild(meta);
 
-  const ticketHtml = roleData.recommended_ticket_size
-    ? `<span class="role-class-badge">Ticket ${roleData.recommended_ticket_size}</span>`
-    : "";
-
-  return `
-    <div class="role-card role-${roleKey}">
-      <div class="role-header">
-        <span class="role-title">${roleKey}</span>
-        ${statusBadge}
-      </div>
-      <div>${modelHtml}</div>
-      <div class="role-meta">
-        <span class="role-class-badge">${roleData.class || "generic"}</span>
-        ${ctxHtml}
-        ${ticketHtml}
-      </div>
-    </div>
-  `;
+  return card;
 }
 
 async function loadAssignment() {
+  const grid = $("roles-full-grid");
   try {
     const data = await api("/v1/assignment");
     $("assignment-refreshed").textContent = `Synced: ${data.refreshed_at}`;
@@ -225,14 +295,12 @@ async function loadAssignment() {
       offlineBadge.textContent = "Online Ready";
       offlineBadge.className = "badge ok";
     }
-
-    const grid = $("roles-full-grid");
-    grid.innerHTML = "";
+    grid.replaceChildren();
     for (const [key, role] of Object.entries(data.roles)) {
-      grid.innerHTML += renderRoleCard(key, role);
+      grid.appendChild(renderRoleCard(key, role));
     }
   } catch (e) {
-    $("roles-full-grid").innerHTML = `<p class="muted">Could not load assignments: ${e.message}</p>`;
+    grid.replaceChildren(el("p", "muted", `Could not load assignments: ${e.message}`));
   }
 }
 
@@ -240,9 +308,9 @@ async function loadAssignmentPreview() {
   try {
     const data = await api("/v1/assignment");
     const previewGrid = $("roles-preview-grid");
-    previewGrid.innerHTML = "";
+    previewGrid.replaceChildren();
     for (const [key, role] of Object.entries(data.roles)) {
-      previewGrid.innerHTML += renderRoleCard(key, role);
+      previewGrid.appendChild(renderRoleCard(key, role));
     }
   } catch {
     // Silent on background preview error
@@ -260,50 +328,52 @@ async function loadProviders() {
 
     $("providers-count").textContent = `${providers.length} providers`;
     const rows = $("provider-rows");
-    rows.innerHTML = "";
+    rows.replaceChildren();
     $("provider-note").hidden = providers.length > 0;
 
     const circuitMap = {};
-    for (const c of healthData.circuits || []) {
-      circuitMap[c.provider] = c;
-    }
+    for (const c of healthData.circuits || []) circuitMap[c.provider] = c;
 
     for (const p of providers) {
-      const tr = document.createElement("tr");
-      const modelsHtml = p.models.length > 0
-        ? p.models.map((m) => {
-            const h = m.health || "ready";
-            const badgeCls = h === "cooling" ? "cooling" : h === "rate_limited" ? "rate_limited" : "ok";
-            return `<span class="badge ${badgeCls}" title="status: ${h}">${m.id}</span>`;
-          }).join(" ")
-        : '<span class="muted font-xs">(passthrough all)</span>';
+      const tr = el("tr");
 
-      const originBadge = p.from_file
-        ? '<span class="badge">file</span>'
-        : '<span class="badge ok">runtime</span>';
+      const modelsCell = td("");
+      if (p.models.length > 0) {
+        for (const m of p.models) {
+          const h = m.health || "ready";
+          const badgeCls = h === "cooling" ? "cooling" : h === "rate_limited" ? "rate_limited" : "ok";
+          modelsCell.appendChild(badge(m.id, badgeCls, `status: ${h}`));
+          modelsCell.appendChild(document.createTextNode(" "));
+        }
+      } else {
+        modelsCell.appendChild(el("span", "muted font-xs", "(passthrough all)"));
+      }
+
+      const originCell = td("");
+      originCell.appendChild(p.from_file ? badge("file", "") : badge("runtime", "ok"));
+      originCell.appendChild(document.createTextNode(" "));
+      const keyCount = p.key_count || 0;
+      const healthyKeys = p.healthy_keys ?? keyCount;
+      originCell.appendChild(
+        keyCount === 0
+          ? badge("no key", "")
+          : badge(`${healthyKeys}/${keyCount} keys`, healthyKeys === 0 ? "cooling" : "ok", "healthy / total keys")
+      );
 
       const circuit = circuitMap[p.id];
       const circuitState = circuit ? circuit.state : "closed";
-      const circuitBadge = circuitState === "open"
-        ? '<span class="badge err" title="Circuit OPEN (5xx tripped)">circuit open</span>'
-        : circuitState === "half-open"
-          ? '<span class="badge warn" title="Circuit HALF-OPEN (probing)">circuit half-open</span>'
-          : '<span class="badge ok" title="Circuit CLOSED (healthy)">circuit closed</span>';
+      const circuitBadge =
+        circuitState === "open"
+          ? badge("circuit open", "err", "Circuit OPEN (5xx tripped)")
+          : circuitState === "half-open"
+            ? badge("circuit half-open", "warn", "Circuit HALF-OPEN (probing)")
+            : badge("circuit closed", "ok", "Circuit CLOSED (healthy)");
 
-      const keyCount = p.key_count || 0;
-      const healthyKeys = p.healthy_keys ?? keyCount;
-      const keyBadge =
-        keyCount === 0
-          ? '<span class="badge">no key</span>'
-          : `<span class="badge ${healthyKeys === 0 ? "cooling" : "ok"}" title="healthy / total keys">${healthyKeys}/${keyCount} keys</span>`;
-
-      tr.innerHTML = `
-        <td class="mono font-bold">${p.id}</td>
-        <td class="mono muted font-xs">${p.base_url}</td>
-        <td>${modelsHtml}</td>
-        <td>${originBadge} ${keyBadge}</td>
-        <td>${circuitBadge}</td>
-      `;
+      tr.appendChild(td("mono font-bold", p.id));
+      tr.appendChild(td("mono muted font-xs", p.base_url));
+      tr.appendChild(modelsCell);
+      tr.appendChild(originCell);
+      tr.appendChild(td("", circuitBadge));
       rows.appendChild(tr);
     }
   } catch (e) {
@@ -315,58 +385,55 @@ async function loadProviders() {
 
 async function loadCombos() {
   try {
-    const [combos, models] = await Promise.all([
-      api("/api/combos"),
-      api("/v1/models"),
-    ]);
+    const [combos, models] = await Promise.all([api("/api/combos"), api("/v1/models")]);
 
     $("combos-count").textContent = `${combos.length} combos`;
     const list = $("combo-list");
-    list.innerHTML = "";
+    list.replaceChildren();
 
     const dl = $("model-list");
-    dl.innerHTML = (models.data || [])
-      .map((m) => `<option value="${m.id}">`)
-      .join("");
+    dl.replaceChildren();
+    for (const m of models.data || []) {
+      const opt = el("option");
+      opt.value = m.id;
+      dl.appendChild(opt);
+    }
 
     for (const c of combos) {
-      const div = document.createElement("div");
       const isVr = c.name.startsWith("VIBE_ROUTER_") || c.name.startsWith("VR_");
-      div.className = `combo ${isVr ? "is-vibe-router-combo is-vr-combo" : ""}`;
+      const div = el("div", `combo ${isVr ? "is-vibe-router-combo is-vr-combo" : ""}`);
 
-      const origin = c.from_file
-        ? '<span class="badge" title="Declared in vibe-router.toml">file</span>'
-        : '<span class="badge ok" title="Authored in runtime">runtime</span>';
+      div.appendChild(el("span", "name", c.name));
+      if (isVr) div.appendChild(badge("AUTO", "badge-vibe-router-combo", "Generated auto-combo"));
+      div.appendChild(
+        c.from_file
+          ? badge("file", "", "Declared in vibe-router.toml")
+          : badge("runtime", "ok", "Authored in runtime")
+      );
+      div.appendChild(el("span", "chain", c.models.join(" → ")));
 
-      const vrBadge = isVr
-        ? '<span class="badge badge-vibe-router-combo" title="Generated auto-combo">AUTO</span>'
-        : "";
-
-      div.innerHTML = `
-        <span class="name">${c.name}</span>
-        ${vrBadge}
-        ${origin}
-        <span class="chain">${c.models.join(" → ")}</span>
-        <span class="actions">
-          <button class="btn-test-combo" data-name="${c.name}">Select Test</button>
-          ${!c.from_file ? `<button class="btn-del danger" data-name="${c.name}">Delete</button>` : ""}
-        </span>
-      `;
-
-      div.querySelector(".btn-test-combo")?.addEventListener("click", () => {
+      const actions = el("span", "actions");
+      const testBtn = el("button", "btn-test-combo", "Select Test");
+      testBtn.dataset.name = c.name;
+      testBtn.addEventListener("click", () => {
         $("test-model").value = c.name;
         showPage("combos");
         $("test-prompt").focus();
       });
+      actions.appendChild(testBtn);
 
       if (!c.from_file) {
-        div.querySelector(".btn-del")?.addEventListener("click", async () => {
+        const delBtn = el("button", "btn-del danger", "Delete");
+        delBtn.dataset.name = c.name;
+        delBtn.addEventListener("click", async () => {
           if (!confirm(`Delete runtime combo "${c.name}"?`)) return;
           await api(`/api/combos/${encodeURIComponent(c.name)}`, { method: "DELETE" });
           loadCombos();
         });
+        actions.appendChild(delBtn);
       }
 
+      div.appendChild(actions);
       list.appendChild(div);
     }
   } catch (e) {
@@ -378,10 +445,7 @@ $("combo-save")?.addEventListener("click", async () => {
   const msg = $("combo-message");
   msg.textContent = "";
   const name = $("combo-name").value.trim();
-  const models = $("combo-models")
-    .value.split(",")
-    .map((s) => s.trim())
-    .filter(Boolean);
+  const models = $("combo-models").value.split(",").map((s) => s.trim()).filter(Boolean);
 
   if (!name || models.length === 0) {
     msg.textContent = "Name and at least one model required.";
@@ -413,32 +477,30 @@ async function loadAliases() {
     const keys = Object.keys(aliases);
     $("aliases-count").textContent = `${keys.length} aliases`;
     const tbody = $("alias-rows");
-    tbody.innerHTML = "";
+    tbody.replaceChildren();
     $("alias-note").hidden = keys.length > 0;
 
     for (const key of keys) {
-      const target = aliases[key];
-      const tr = document.createElement("tr");
-      tr.innerHTML = `
-        <td class="mono font-bold">${key}</td>
-        <td class="mono muted font-xs">${target}</td>
-        <td class="right">
-          <button class="btn-del danger font-xs" data-alias="${key}">Delete</button>
-        </td>
-      `;
+      const tr = el("tr");
+      tr.appendChild(td("mono font-bold", key));
+      tr.appendChild(td("mono muted font-xs", aliases[key]));
 
-      tr.querySelector(".btn-del")?.addEventListener("click", async () => {
+      const actionCell = td("right");
+      const delBtn = el("button", "btn-del danger font-xs", "Delete");
+      delBtn.dataset.alias = key;
+      delBtn.addEventListener("click", async () => {
         if (!confirm(`Delete alias "${key}"?`)) return;
         await api(`/api/aliases/${encodeURIComponent(key)}`, { method: "DELETE" });
         loadAliases();
       });
-
+      actionCell.appendChild(delBtn);
+      tr.appendChild(actionCell);
       tbody.appendChild(tr);
     }
   } catch (e) {
     console.error("Failed to load aliases:", e);
   }
-}
+});
 
 $("alias-save")?.addEventListener("click", async () => {
   const msg = $("alias-message");
@@ -474,38 +536,32 @@ async function loadProxies() {
     const proxies = data.proxies || [];
     $("proxies-count").textContent = `${proxies.length} proxies`;
     const tbody = $("proxy-rows");
-    tbody.innerHTML = "";
+    tbody.replaceChildren();
     $("proxy-note").hidden = proxies.length > 0;
 
     for (const p of proxies) {
-      const tr = document.createElement("tr");
-      const tagBadge = `<span class="badge ${p.tag === 'cf-worker' ? 'badge-vibe-router-combo' : 'ok'}">${p.tag}</span>`;
-      const statusBadge = p.enabled
-        ? '<span class="badge ok">active</span>'
-        : '<span class="badge cooling">disabled</span>';
+      const tr = el("tr");
+      tr.appendChild(td("mono font-bold", p.id));
+      tr.appendChild(td("", badge(p.tag, p.tag === "cf-worker" ? "badge-vibe-router-combo" : "ok")));
+      tr.appendChild(td("mono muted font-xs", p.url));
+      tr.appendChild(td("", p.enabled ? badge("active", "ok") : badge("disabled", "cooling")));
 
-      tr.innerHTML = `
-        <td class="mono font-bold">${p.id}</td>
-        <td>${tagBadge}</td>
-        <td class="mono muted font-xs">${p.url}</td>
-        <td>${statusBadge}</td>
-        <td class="right">
-          <button class="btn-del danger font-xs" data-id="${p.id}">Delete</button>
-        </td>
-      `;
-
-      tr.querySelector(".btn-del")?.addEventListener("click", async () => {
+      const actionCell = td("right");
+      const delBtn = el("button", "btn-del danger font-xs", "Delete");
+      delBtn.dataset.id = p.id;
+      delBtn.addEventListener("click", async () => {
         if (!confirm(`Remove proxy "${p.id}"?`)) return;
         await api(`/api/proxies/${encodeURIComponent(p.id)}`, { method: "DELETE" });
         loadProxies();
       });
-
+      actionCell.appendChild(delBtn);
+      tr.appendChild(actionCell);
       tbody.appendChild(tr);
     }
   } catch (e) {
     console.error("Failed to load proxies:", e);
   }
-}
+});
 
 $("proxy-save")?.addEventListener("click", async () => {
   const msg = $("proxy-message");
@@ -539,7 +595,7 @@ $("proxy-save")?.addEventListener("click", async () => {
 $("btn-copy-worker-script")?.addEventListener("click", async () => {
   const btn = $("btn-copy-worker-script");
   try {
-    const resp = await fetch("/api/relay/worker.js");
+    const resp = await authFetch("/api/relay/worker.js");
     const script = await resp.text();
     await navigator.clipboard.writeText(script);
     const orig = btn.textContent;
@@ -563,35 +619,21 @@ async function loadCosts() {
     $("costs-p50").textContent = `${m.p50_latency_ms || 0} ms`;
     $("costs-p95-p99").textContent = `${m.p95_latency_ms || 0} / ${m.p99_latency_ms || 0} ms`;
 
-    // Providers spend table
-    const pTbody = $("costs-provider-rows");
-    pTbody.innerHTML = "";
-    for (const [provider, line] of Object.entries(b.by_provider || {})) {
-      const tr = document.createElement("tr");
-      tr.innerHTML = `
-        <td class="mono font-bold">${provider}</td>
-        <td>${fmtTokens(line.requests)}</td>
-        <td>${fmtTokens(line.prompt_tokens)}</td>
-        <td>${fmtTokens(line.completion_tokens)}</td>
-        <td class="right mono font-bold ok">${fmtUsd(line.cost_micros)}</td>
-      `;
-      pTbody.appendChild(tr);
-    }
-
-    // Models spend table
-    const mTbody = $("costs-model-rows");
-    mTbody.innerHTML = "";
-    for (const [model, line] of Object.entries(b.by_model || {})) {
-      const tr = document.createElement("tr");
-      tr.innerHTML = `
-        <td class="mono font-bold">${model}</td>
-        <td>${fmtTokens(line.requests)}</td>
-        <td>${fmtTokens(line.prompt_tokens)}</td>
-        <td>${fmtTokens(line.completion_tokens)}</td>
-        <td class="right mono font-bold ok">${fmtUsd(line.cost_micros)}</td>
-      `;
-      mTbody.appendChild(tr);
-    }
+    const fillSpend = (tbodyId, entries) => {
+      const tbody = $(tbodyId);
+      tbody.replaceChildren();
+      for (const [name, line] of Object.entries(entries || {})) {
+        const tr = el("tr");
+        tr.appendChild(td("mono font-bold", name));
+        tr.appendChild(td("", fmtTokens(line.requests)));
+        tr.appendChild(td("", fmtTokens(line.prompt_tokens)));
+        tr.appendChild(td("", fmtTokens(line.completion_tokens)));
+        tr.appendChild(td("right mono font-bold ok", fmtUsd(line.cost_micros)));
+        tbody.appendChild(tr);
+      }
+    };
+    fillSpend("costs-provider-rows", b.by_provider);
+    fillSpend("costs-model-rows", b.by_model);
   } catch (e) {
     console.error("Failed to load costs:", e);
   }
@@ -618,7 +660,7 @@ $("btn-run-test")?.addEventListener("click", async () => {
 
   const t0 = performance.now();
   try {
-    const resp = await fetch("/v1/chat/completions", {
+    const resp = await authFetch("/v1/chat/completions", {
       method: "POST",
       headers: { "content-type": "application/json" },
       body: JSON.stringify({
@@ -676,29 +718,30 @@ async function loadUsage() {
   try {
     const rows = await api("/api/usage/recent?limit=50");
     const tbody = $("usage-rows");
-    tbody.innerHTML = "";
+    tbody.replaceChildren();
     $("usage-note").hidden = rows.length > 0;
 
     for (const r of rows) {
-      const tr = document.createElement("tr");
       const isEst = r.usage_estimated;
       const prefix = isEst ? "~" : "";
       const promptTok = r.prompt_tokens ? `${prefix}${fmtTokens(r.prompt_tokens)}` : "0";
       const compTok = r.completion_tokens ? `${prefix}${fmtTokens(r.completion_tokens)}` : "0";
-      const estBadge = isEst
-        ? ' <span class="estimated" title="Estimated, not reported by provider">~est</span>'
-        : "";
 
-      tr.innerHTML = `
-        <td class="mono muted font-xs">${fmtTime(r.ts_ms)}</td>
-        <td class="mono font-bold">${r.requested_model}</td>
-        <td class="mono muted font-xs">${r.provider || "—"} / ${r.served_model || "—"}</td>
-        <td>
-          <span class="badge ${r.status < 300 ? "ok" : "err"}">${r.status}</span>
-        </td>
-        <td class="mono right">${promptTok} / ${compTok}${estBadge}</td>
-        <td class="mono right muted font-xs">${r.latency_ms} ms</td>
-      `;
+      const tokenCell = td("mono right", `${promptTok} / ${compTok}`);
+      if (isEst) {
+        tokenCell.appendChild(document.createTextNode(" "));
+        const est = el("span", "estimated", "~est");
+        est.title = "Estimated, not reported by provider";
+        tokenCell.appendChild(est);
+      }
+
+      const tr = el("tr");
+      tr.appendChild(td("mono muted font-xs", fmtTime(r.ts_ms)));
+      tr.appendChild(td("mono font-bold", r.requested_model));
+      tr.appendChild(td("mono muted font-xs", `${r.provider || "—"} / ${r.served_model || "—"}`));
+      tr.appendChild(td("", badge(r.status, r.status < 300 ? "ok" : "err")));
+      tr.appendChild(tokenCell);
+      tr.appendChild(td("mono right muted font-xs", `${r.latency_ms} ms`));
       tbody.appendChild(tr);
     }
   } catch (e) {
@@ -709,6 +752,7 @@ async function loadUsage() {
 // ---------------------------------------------------------------- INIT
 
 initTheme();
+initKeyUI();
 loadStatus();
 $("btn-refresh-status")?.addEventListener("click", loadStatus);
 setInterval(loadStatus, 5000);

@@ -69,6 +69,50 @@ pub fn compute_simple_cache_key(
     compute_cache_key(model_id, temperature, None, None, messages)
 }
 
+/// Every request field that can change the response. Two requests with the same
+/// model and the same values for all of these are cache-equivalent.
+const RESPONSE_SHAPING_FIELDS: &[&str] = &[
+    "messages",
+    "tools",
+    "tool_choice",
+    "temperature",
+    "top_p",
+    "max_tokens",
+    "max_completion_tokens",
+    "stop",
+    "response_format",
+    "seed",
+    "n",
+    "presence_penalty",
+    "frequency_penalty",
+    "logit_bias",
+];
+
+/// Canonical cache key over the full response-shaping surface of a request
+/// body. Unlike [`compute_cache_key`], this captures `max_tokens`, `stop`,
+/// `seed`, `tool_choice`, penalties, etc., so e.g. `max_tokens=5` and
+/// `max_tokens=2000` never collide. Object keys are serialized deterministically
+/// (serde_json sorts map keys), so field order does not affect the hash.
+pub fn compute_request_cache_key(model_id: &str, body: &serde_json::Value) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(model_id.as_bytes());
+    for field in RESPONSE_SHAPING_FIELDS {
+        hasher.update(b"|");
+        hasher.update(field.as_bytes());
+        hasher.update(b"=");
+        match body.get(field) {
+            Some(v) => hasher.update(serde_json::to_string(v).unwrap_or_default().as_bytes()),
+            None => hasher.update(b"null"),
+        }
+    }
+    let hash = hasher.finalize();
+    hash.iter().fold(String::with_capacity(64), |mut s, b| {
+        use std::fmt::Write;
+        let _ = write!(s, "{b:02x}");
+        s
+    })
+}
+
 /// A cached prompt completion response (non-streaming JSON).
 #[derive(Debug, Clone)]
 pub struct CachedResponse {
@@ -426,6 +470,44 @@ mod tests {
             "different tool lists produce distinct keys"
         );
         assert_ne!(k_plain, k_top_p2, "different top_p produces distinct keys");
+    }
+
+    #[test]
+    fn canonical_request_key_covers_all_shaping_fields() {
+        let base = serde_json::json!({
+            "messages": [{"role":"user","content":"hi"}],
+            "max_tokens": 5
+        });
+        let k_base = compute_request_cache_key("m", &base);
+
+        // Identical body -> identical key.
+        assert_eq!(k_base, compute_request_cache_key("m", &base.clone()));
+
+        // Each response-shaping field changes the key.
+        let variants = [
+            serde_json::json!({"messages":[{"role":"user","content":"hi"}],"max_tokens":2000}),
+            serde_json::json!({"messages":[{"role":"user","content":"hi"}],"max_tokens":5,"temperature":0.9}),
+            serde_json::json!({"messages":[{"role":"user","content":"hi"}],"max_tokens":5,"seed":42}),
+            serde_json::json!({"messages":[{"role":"user","content":"hi"}],"max_tokens":5,"stop":["x"]}),
+            serde_json::json!({"messages":[{"role":"user","content":"hi"}],"max_tokens":5,"tool_choice":"required"}),
+            serde_json::json!({"messages":[{"role":"user","content":"hi"}],"max_tokens":5,"presence_penalty":0.5}),
+            serde_json::json!({"messages":[{"role":"user","content":"hi"}],"max_tokens":5,"n":2}),
+        ];
+        for v in variants {
+            assert_ne!(
+                k_base,
+                compute_request_cache_key("m", &v),
+                "field must affect key: {v}"
+            );
+        }
+
+        // Object key order does not matter (deterministic serialization).
+        let a = serde_json::json!({"messages":[{"role":"user","content":"hi"}],"temperature":0.2,"top_p":0.9});
+        let b = serde_json::json!({"top_p":0.9,"temperature":0.2,"messages":[{"content":"hi","role":"user"}]});
+        assert_eq!(
+            compute_request_cache_key("m", &a),
+            compute_request_cache_key("m", &b)
+        );
     }
 
     #[test]

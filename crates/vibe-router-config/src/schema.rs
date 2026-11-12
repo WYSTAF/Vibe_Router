@@ -34,6 +34,11 @@ pub struct RouterConfig {
     /// In-memory prompt & response LRU cache.
     #[serde(default)]
     pub cache: CacheConfig,
+    /// When true, custom `error_rules` fully replace the built-in defaults.
+    /// When false (default), custom rules are merged ahead of the defaults so
+    /// the baseline classification still applies to anything not overridden.
+    #[serde(default)]
+    pub replace_default_error_rules: bool,
 }
 
 impl Default for RouterConfig {
@@ -50,17 +55,32 @@ impl Default for RouterConfig {
             error_rules: default_error_rules(),
             roles: None,
             cache: CacheConfig::default(),
+            replace_default_error_rules: false,
         }
     }
+}
+
+/// Merge custom error rules with the built-in defaults. Custom rules take
+/// precedence (evaluated first); defaults fill in anything not overridden.
+/// With `replace = true`, only the custom rules are used.
+fn merge_error_rules(custom: Vec<ErrorRule>, replace: bool) -> Vec<ErrorRule> {
+    if replace {
+        return custom;
+    }
+    let mut merged = custom;
+    for d in default_error_rules() {
+        if !merged.iter().any(|r| r.match_ == d.match_) {
+            merged.push(d);
+        }
+    }
+    merged
 }
 
 impl RouterConfig {
     pub fn load(path: &str) -> ConfigResult<Self> {
         let raw = std::fs::read_to_string(path).map_err(|e| ConfigError::read(path, e))?;
         let mut cfg: Self = toml::from_str(&raw).map_err(|e| ConfigError::parse(path, e))?;
-        if cfg.error_rules.is_empty() {
-            cfg.error_rules = default_error_rules();
-        }
+        cfg.error_rules = merge_error_rules(cfg.error_rules, cfg.replace_default_error_rules);
         cfg.validate()?;
         Ok(cfg)
     }
@@ -71,9 +91,7 @@ impl RouterConfig {
     /// wrong trait for it.
     pub fn parse_str(raw: &str) -> ConfigResult<Self> {
         let mut cfg: Self = toml::from_str(raw).map_err(|e| ConfigError::parse("<inline>", e))?;
-        if cfg.error_rules.is_empty() {
-            cfg.error_rules = default_error_rules();
-        }
+        cfg.error_rules = merge_error_rules(cfg.error_rules, cfg.replace_default_error_rules);
         cfg.validate()?;
         Ok(cfg)
     }
@@ -269,6 +287,16 @@ pub struct ServerConfig {
     pub api_key_env: Vec<String>,
     #[serde(default = "default_log_dir")]
     pub log_dir: String,
+    /// When true, runtime-authored providers and proxies may target loopback,
+    /// link-local, and private (RFC1918) networks. Default false blocks SSRF
+    /// via the admin API; enable only for trusted local upstreams (Ollama,
+    /// Vibe-Local). Config-file providers are always trusted.
+    #[serde(default)]
+    pub allow_local_upstreams: bool,
+    /// Auto-discover host environment proxies and local VPN ports at startup.
+    /// Disable for hermetic tests or locked-down deployments.
+    #[serde(default = "default_true")]
+    pub auto_discover_proxies: bool,
 }
 
 fn default_host() -> String {
@@ -289,6 +317,8 @@ impl Default for ServerConfig {
             api_keys: Vec::new(),
             api_key_env: Vec::new(),
             log_dir: default_log_dir(),
+            allow_local_upstreams: false,
+            auto_discover_proxies: true,
         }
     }
 }

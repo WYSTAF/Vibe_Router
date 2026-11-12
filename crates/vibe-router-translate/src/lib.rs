@@ -15,12 +15,16 @@
 #![forbid(unsafe_code)]
 
 pub mod anthropic;
+pub mod anthropic_upstream;
 mod chat;
 mod sse;
 
 pub use anthropic::{
     anthropic_to_openai_request, openai_chunk_to_anthropic_events, openai_to_anthropic_response,
     AnthropicStreamState,
+};
+pub use anthropic_upstream::{
+    anthropic_to_openai_response, openai_to_anthropic_request, AnthropicToOpenAiStream,
 };
 pub use chat::{translate_request, translator_for, Translator, OPENAI_IDENTITY};
 pub use sse::{encode_frame, SseDecoder, SseEvent, UsageAccumulator, DONE_TOKEN};

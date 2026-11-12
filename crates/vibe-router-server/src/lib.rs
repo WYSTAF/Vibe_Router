@@ -12,6 +12,7 @@
 
 pub mod assignment;
 pub mod error;
+pub mod guard;
 pub mod routes;
 pub mod sse;
 pub mod state;

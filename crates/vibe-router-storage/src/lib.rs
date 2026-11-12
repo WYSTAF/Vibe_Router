@@ -23,15 +23,17 @@
 mod backend;
 mod memory;
 mod sqlite;
-mod sqlite_backend;
 mod types;
 
 pub use backend::{BackendError, BackendResult, StorageBackend};
 pub use memory::MemoryStore;
 pub use sqlite::SqliteStore;
-pub use sqlite_backend::SqliteBackend as SqliteAsyncBackend;
+/// Backwards-compatible name: the async backend and the sync store are now the
+/// same single owner ([`SqliteStore`]).
+pub use sqlite::SqliteStore as SqliteAsyncBackend;
 pub use types::{
-    Combo, CostBreakdown, CostLine, ModelRecord, Provider, Rates, UsageMetricsSummary, UsageRecord,
+    Combo, CostBreakdown, CostLine, ModelRecord, Provider, ProxyRecord, Rates, UsageMetricsSummary,
+    UsageRecord,
 };
 
 use std::path::Path;
@@ -90,6 +92,87 @@ pub struct RuntimeCombo {
     pub description: Option<String>,
     /// `provider/model` strings in priority order.
     pub models: Vec<String>,
+}
+
+// Conversions between the legacy sync record shapes and the unified async
+// shapes. Both surfaces persist the same payload, so these are lossless for
+// every field the runtime uses.
+impl From<RuntimeProvider> for types::Provider {
+    fn from(rp: RuntimeProvider) -> Self {
+        types::Provider {
+            id: rp.id,
+            display_name: rp.display_name,
+            base_url: rp.base_url,
+            format: rp.format.unwrap_or_else(|| "openai".into()),
+            auth_scheme: rp.auth_scheme.unwrap_or_else(|| "Bearer".into()),
+            auth_secret: rp.auth_secret,
+            api_keys: rp.api_keys,
+            key_strategy: rp.key_strategy,
+            headers: rp.headers,
+            models: rp
+                .models
+                .into_iter()
+                .map(|m| types::ModelRecord {
+                    id: m.id,
+                    name: m.name,
+                    context: m.context,
+                    max_output: m.max_output,
+                })
+                .collect(),
+            passthrough: rp.passthrough,
+            last_health_check: None,
+            enabled: true,
+        }
+    }
+}
+
+impl From<types::Provider> for RuntimeProvider {
+    fn from(p: types::Provider) -> Self {
+        RuntimeProvider {
+            id: p.id,
+            display_name: p.display_name,
+            base_url: p.base_url,
+            format: Some(p.format),
+            auth_scheme: Some(p.auth_scheme),
+            auth_secret: p.auth_secret,
+            api_keys: p.api_keys,
+            key_strategy: p.key_strategy,
+            headers: p.headers,
+            models: p
+                .models
+                .into_iter()
+                .map(|m| RuntimeModel {
+                    id: m.id,
+                    name: m.name,
+                    context: m.context,
+                    max_output: m.max_output,
+                })
+                .collect(),
+            passthrough: p.passthrough,
+        }
+    }
+}
+
+impl From<RuntimeCombo> for types::Combo {
+    fn from(c: RuntimeCombo) -> Self {
+        types::Combo {
+            name: c.name,
+            description: c.description,
+            models: c.models,
+            created_at: None,
+            updated_at: None,
+        }
+    }
+}
+
+impl From<types::Combo> for RuntimeCombo {
+    fn from(c: types::Combo) -> Self {
+        RuntimeCombo {
+            name: c.name,
+            description: c.description,
+            models: c.models,
+        }
+    }
 }
 
 /// Rows as read back out of the store (record + identity + timestamp).
@@ -165,7 +248,7 @@ pub fn open(path: &str) -> StorageResult<Arc<dyn Store>> {
             std::fs::create_dir_all(parent).map_err(|e| StorageError::Io(e.to_string()))?;
         }
     }
-    Ok(Arc::new(SqliteStore::open(path)?))
+    Ok(Arc::new(SqliteStore::open_sync(path)?))
 }
 
 /// Open the async backend at `path` (`:memory:` for a throwaway store).

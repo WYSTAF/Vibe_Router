@@ -1,44 +1,45 @@
-//! The generic OpenAI-compatible HTTP transport.
+//! The generic upstream HTTP transport.
 //!
-//! One implementation of [`UpstreamClient`] serves every configured provider
-//! — that is the point of the provider abstraction: providers are *data*
-//! (`ProviderConfig` records), and this code path knows nothing about which
-//! brand sits at a base URL. Custom provider behaviour, when it ever arrives,
-//! is a different `UpstreamClient` selected at the server's wiring point;
-//! nothing here changes.
+//! One implementation of [`UpstreamClient`] serves every configured provider.
+//! Providers are *data* (`ProviderConfig` records); this code path knows nothing
+//! about which brand sits at a base URL. It honors the provider's configured
+//! wire format (OpenAI or Anthropic), routes through a sticky tagged proxy when
+//! one is registered, and rotates a multi-key pool on 429.
 //!
-//! Secrets are resolved at request time from their `SecretRef` — an env var
-//! is re-read on every call, so a rotated key is picked up without a reload.
+//! Secrets are resolved at request time from their `SecretRef` — an env var is
+//! re-read on every call, so a rotated key is picked up without a reload.
 //!
-//! Timeout semantics (v0.1, documented honestly):
+//! Timeout semantics:
 //!   * non-streaming: the whole response (headers + body) must arrive within
-//!     `connect_timeout` — reqwest gives us no header-only timeout, and a
-//!     stalled body is the same failure as a stalled header;
+//!     `connect_timeout`;
 //!   * streaming: `first_chunk_timeout` covers time to the first SSE byte,
-//!     `chunk_stall_timeout` the gap between subsequent chunks, with no total
-//!     cap (a long generation is not a fault).
+//!     `chunk_stall_timeout` the gap between subsequent chunks.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
+use parking_lot::Mutex;
 use tokio::sync::mpsc;
 use vibe_router_core::{
     Auth, HeaderScheme, SecretRef, StreamEvent, TransportError, TransportErrorKind, UpstreamClient,
-    UpstreamRequest, UpstreamResponse, Usage,
+    UpstreamRequest, UpstreamResponse, Usage, WireFormat,
 };
 use vibe_router_translate::SseDecoder;
 
+use crate::proxy::{ProxyEntry, ProxyTag};
 use crate::Registry;
 
 /// How many buffered chunks a slow client may lag behind the upstream before
-/// backpressure pauses the read. The server drains this channel into the
-/// client socket.
+/// backpressure pauses the read.
 const STREAM_BUFFER: usize = 32;
 
 pub struct HttpUpstream {
     client: reqwest::Client,
     registry: Arc<Registry>,
+    /// Per-proxy-URL clients (reqwest binds a proxy at client build time).
+    proxy_clients: Mutex<HashMap<String, reqwest::Client>>,
 }
 
 impl HttpUpstream {
@@ -46,16 +47,70 @@ impl HttpUpstream {
         Self::with_client(registry, default_client())
     }
 
-    /// Build on an existing client so integration tests (and any embedding
-    /// binary) can share one pool.
     pub fn with_client(registry: Arc<Registry>, client: reqwest::Client) -> Self {
-        Self { client, registry }
+        Self {
+            client,
+            registry,
+            proxy_clients: Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// A client bound to a forward proxy, cached per URL. Falls back to the
+    /// direct client if the proxy URL is unusable.
+    fn client_for_proxy(&self, url: &str) -> reqwest::Client {
+        let mut cache = self.proxy_clients.lock();
+        if let Some(c) = cache.get(url) {
+            return c.clone();
+        }
+        let proxy = match reqwest::Proxy::all(url) {
+            Ok(p) => p,
+            Err(e) => {
+                tracing::warn!(proxy = url, "invalid proxy URL, using direct: {e}");
+                return self.client.clone();
+            }
+        };
+        match reqwest::Client::builder()
+            .pool_max_idle_per_host(8)
+            .proxy(proxy)
+            .build()
+        {
+            Ok(c) => {
+                cache.insert(url.to_string(), c.clone());
+                c
+            }
+            Err(e) => {
+                tracing::warn!(proxy = url, "cannot build proxy client, using direct: {e}");
+                self.client.clone()
+            }
+        }
+    }
+
+    /// Resolve (client, request URL, optional reverse-relay target) for a proxy.
+    /// `cf-worker` entries are reverse relays (X-Target-URL); other tags are
+    /// forward proxies bound into the client.
+    fn route_for(
+        &self,
+        proxy: Option<&ProxyEntry>,
+        base_url: &str,
+    ) -> (reqwest::Client, String, Option<String>) {
+        match proxy {
+            None => (self.client.clone(), base_url.to_string(), None),
+            Some(p) if p.tag == ProxyTag::CfWorker => (
+                self.client.clone(),
+                p.url.clone(),
+                Some(base_url.to_string()),
+            ),
+            Some(p) => (self.client_for_proxy(&p.url), base_url.to_string(), None),
+        }
     }
 
     fn build_request(
         &self,
+        client: &reqwest::Client,
         req: &UpstreamRequest,
         key: Option<&SecretRef>,
+        url: &str,
+        relay_target: Option<&str>,
     ) -> Result<reqwest::RequestBuilder, TransportError> {
         let provider = self.registry.provider(&req.provider_id).ok_or_else(|| {
             transport(
@@ -64,13 +119,14 @@ impl HttpUpstream {
             )
         })?;
         let t = &provider.transport;
-        let mut builder = self.client.post(&t.base_url).json(&req.body);
+        let mut builder = client.post(url).json(&req.body);
         for (name, value) in &t.headers {
             builder = builder.header(name, value);
         }
+        if let Some(target) = relay_target {
+            builder = builder.header("X-Target-URL", target);
+        }
 
-        // Credential: a pool-selected key when given, else the provider's
-        // single configured secret (or none).
         let (secret, scheme) = match (&provider.auth, key) {
             (Auth::None, _) => return Ok(builder),
             (Auth::Bearer { .. }, Some(k)) => (resolve_secret(k)?, HeaderScheme::Bearer),
@@ -111,10 +167,14 @@ impl HttpUpstream {
 
     async fn execute_json(
         &self,
+        client: &reqwest::Client,
         req: &UpstreamRequest,
         key: Option<&SecretRef>,
+        url: &str,
+        relay_target: Option<&str>,
+        format: WireFormat,
     ) -> UpstreamResponse {
-        let builder = match self.build_request(req, key) {
+        let builder = match self.build_request(client, req, key, url, relay_target) {
             Ok(b) => b,
             Err(e) => return UpstreamResponse::Transport(e),
         };
@@ -130,9 +190,6 @@ impl HttpUpstream {
             Ok(Ok(r)) => r,
         };
         let status = response.status().as_u16();
-        // Non-streaming: read the whole body within the same budget. A
-        // provider that stalls mid-body is indistinguishable from one that
-        // stalls before headers, and the fallback answer is the same.
         let text = match tokio::time::timeout(req.connect_timeout, response.text()).await {
             Err(_) => {
                 return UpstreamResponse::Transport(transport(
@@ -145,10 +202,21 @@ impl HttpUpstream {
         };
         let body: serde_json::Value = match serde_json::from_str(&text) {
             Ok(v) => v,
-            // Keep the raw text: the classifier's text rules may still match
-            // a provider's own wording inside an HTML or plain error page.
             Err(_) => serde_json::Value::String(truncate_text(&text)),
         };
+
+        // A successful Anthropic response is converted to OpenAI shape so the
+        // router's usage extraction and classification stay format-agnostic.
+        if (200..300).contains(&status) && format == WireFormat::Anthropic {
+            let converted = vibe_router_translate::anthropic_to_openai_response(&body, &req.model);
+            let usage = extract_usage(&converted);
+            return UpstreamResponse::Json {
+                status,
+                body: converted,
+                usage,
+            };
+        }
+
         let usage = extract_usage(&body);
         UpstreamResponse::Json {
             status,
@@ -159,10 +227,14 @@ impl HttpUpstream {
 
     async fn execute_stream(
         &self,
+        client: &reqwest::Client,
         req: &UpstreamRequest,
         key: Option<&SecretRef>,
+        url: &str,
+        relay_target: Option<&str>,
+        format: WireFormat,
     ) -> UpstreamResponse {
-        let builder = match self.build_request(req, key) {
+        let builder = match self.build_request(client, req, key, url, relay_target) {
             Ok(b) => b,
             Err(e) => return UpstreamResponse::Transport(e),
         };
@@ -178,8 +250,11 @@ impl HttpUpstream {
         };
         let status = response.status().as_u16();
         if !(200..300).contains(&status) {
-            // An error before the first byte: safe to classify and fail over.
-            let text = response.text().await.unwrap_or_default();
+            // An error before the first byte: bound the body read, then classify.
+            let text = match tokio::time::timeout(req.connect_timeout, response.text()).await {
+                Ok(Ok(t)) => t,
+                _ => String::new(),
+            };
             let body: serde_json::Value = match serde_json::from_str(&text) {
                 Ok(v) => v,
                 Err(_) => serde_json::Value::String(truncate_text(&text)),
@@ -191,17 +266,14 @@ impl HttpUpstream {
             };
         }
 
-        // Good stream: hand back a channel; the pump task reads bytes and
-        // yields decoded SSE payloads. When the reader drops the channel
-        // (client disconnect), the pump stops and the response is dropped —
-        // which closes the upstream connection. That is fail-fast on
-        // disconnect, not a leak.
         let (tx, rx) = mpsc::channel(STREAM_BUFFER);
         tokio::spawn(pump_stream(
             response,
             tx,
             req.first_chunk_timeout,
             req.chunk_stall_timeout,
+            format,
+            req.model.clone(),
         ));
         UpstreamResponse::Stream { status, events: rx }
     }
@@ -212,23 +284,19 @@ fn is_rate_limited(resp: &UpstreamResponse) -> bool {
     matches!(resp, UpstreamResponse::Json { status: 429, .. })
 }
 
+/// A stable identifier for sticky proxy affinity, derived from the credential.
+fn secret_identifier(secret: &SecretRef) -> String {
+    match secret {
+        SecretRef::Env(name) => format!("env:{name}"),
+        SecretRef::File(path) => format!("file:{path}"),
+        SecretRef::Literal(value) => value.clone(),
+        SecretRef::Empty => String::new(),
+    }
+}
+
 #[async_trait]
 impl UpstreamClient for HttpUpstream {
     async fn execute(&self, req: UpstreamRequest) -> UpstreamResponse {
-        // v0.1: the translator is the identity for openai->openai, but
-        // request-shaping belongs here so stream_options (usage on the final
-        // chunk) is applied exactly once, on the way out.
-        let mut body = vibe_router_translate::translate_request(
-            vibe_router_core::WireFormat::OpenAi,
-            vibe_router_core::WireFormat::OpenAi,
-            req.body.clone(),
-            req.stream,
-        );
-        if req.stream {
-            body["stream"] = serde_json::Value::Bool(true);
-        }
-        let req = UpstreamRequest { body, ..req };
-
         let provider = match self.registry.provider(&req.provider_id) {
             Some(p) => p,
             None => {
@@ -238,24 +306,43 @@ impl UpstreamClient for HttpUpstream {
                 ))
             }
         };
+        let format = provider.transport.format;
 
-        // No pool (no credential, or an empty one): single attempt as before.
+        // Shape the outgoing body for the provider's wire format.
+        let mut body = if format == WireFormat::Anthropic {
+            vibe_router_translate::openai_to_anthropic_request(&req.body)
+        } else {
+            vibe_router_translate::translate_request(
+                WireFormat::OpenAi,
+                WireFormat::OpenAi,
+                req.body.clone(),
+                req.stream,
+            )
+        };
+        if req.stream {
+            body["stream"] = serde_json::Value::Bool(true);
+        }
+        let req = UpstreamRequest { body, ..req };
+        let base_url = provider.transport.base_url.clone();
+
+        // No pool (no credential, or an empty one): single attempt, still
+        // routed through a sticky proxy when one is registered.
         if provider.key_pool.is_empty() {
-            return self.run_once(&req, None).await;
+            let proxy = self.registry.proxies().select_sticky(&provider.id, None);
+            let (client, url, relay) = self.route_for(proxy.as_ref(), &base_url);
+            return self
+                .run_once(&client, &req, None, &url, relay.as_deref(), format)
+                .await;
         }
 
-        // Multi-key pool: try healthy keys in order. A 429 cools that key and
-        // we immediately retry with the next one — the client never sees the
-        // rate-limit error unless *every* key is exhausted or cooling.
+        // Multi-key pool: try healthy keys in order, each through its sticky
+        // proxy. A 429 cools that key and we retry the next one transparently.
         let mut attempted: Vec<usize> = Vec::new();
         let mut last_rate_limited: Option<UpstreamResponse> = None;
 
         loop {
             let Some((idx, secret_ref)) = provider.key_pool.select_healthy_except(&attempted)
             else {
-                // No healthy key left. Return the last 429 so the router's
-                // classifier can cool the candidate and fail over; if we never
-                // saw one, report exhausted credentials.
                 return last_rate_limited.unwrap_or_else(|| {
                     UpstreamResponse::Transport(transport(
                         TransportErrorKind::NoCredential,
@@ -265,7 +352,21 @@ impl UpstreamClient for HttpUpstream {
             };
             attempted.push(idx);
 
-            let resp = self.run_once(&req, Some(&secret_ref)).await;
+            let proxy = self
+                .registry
+                .proxies()
+                .select_sticky(&secret_identifier(&secret_ref), None);
+            let (client, url, relay) = self.route_for(proxy.as_ref(), &base_url);
+            let resp = self
+                .run_once(
+                    &client,
+                    &req,
+                    Some(&secret_ref),
+                    &url,
+                    relay.as_deref(),
+                    format,
+                )
+                .await;
             provider.key_pool.release_in_flight(idx);
 
             if is_rate_limited(&resp) {
@@ -279,30 +380,50 @@ impl UpstreamClient for HttpUpstream {
                 continue;
             }
 
-            provider.key_pool.mark_success(idx);
+            // Only a 2xx resets the key's 429 backoff streak; a 5xx must not
+            // clear a rate-limit cooldown.
+            if matches!(&resp, UpstreamResponse::Json { status, .. } if (200..300).contains(status))
+                || matches!(&resp, UpstreamResponse::Stream { .. })
+            {
+                provider.key_pool.mark_success(idx);
+            }
             return resp;
         }
     }
 }
 
 impl HttpUpstream {
-    async fn run_once(&self, req: &UpstreamRequest, key: Option<&SecretRef>) -> UpstreamResponse {
+    async fn run_once(
+        &self,
+        client: &reqwest::Client,
+        req: &UpstreamRequest,
+        key: Option<&SecretRef>,
+        url: &str,
+        relay_target: Option<&str>,
+        format: WireFormat,
+    ) -> UpstreamResponse {
         if req.stream {
-            self.execute_stream(req, key).await
+            self.execute_stream(client, req, key, url, relay_target, format)
+                .await
         } else {
-            self.execute_json(req, key).await
+            self.execute_json(client, req, key, url, relay_target, format)
+                .await
         }
     }
 }
 
-/// Copy bytes off the upstream, decode SSE, forward payloads.
+/// Copy bytes off the upstream, decode SSE, forward payloads (converting
+/// Anthropic events to OpenAI chunks when the upstream speaks Anthropic).
 async fn pump_stream(
     mut response: reqwest::Response,
     tx: mpsc::Sender<StreamEvent>,
     first_chunk_timeout: Duration,
     stall_timeout: Duration,
+    format: WireFormat,
+    model: String,
 ) {
     let mut decoder = SseDecoder::default();
+    let mut anth_stream = vibe_router_translate::AnthropicToOpenAiStream::new(model);
     let mut first = true;
     loop {
         let budget = if first {
@@ -328,13 +449,23 @@ async fn pump_stream(
                     .await;
                 return;
             }
-            Ok(Ok(None)) => break, // EOF
+            Ok(Ok(None)) => break,
             Ok(Ok(Some(bytes))) => bytes,
         };
         first = false;
         for ev in decoder.push(&chunk) {
-            if forward(&tx, ev.data).await.is_err() {
-                return; // receiver gone: client disconnected
+            if format == WireFormat::Anthropic {
+                let is_stop = ev.data.contains("\"message_stop\"");
+                for openai_chunk in anth_stream.push(&ev.data) {
+                    if forward(&tx, openai_chunk).await.is_err() {
+                        return;
+                    }
+                }
+                if is_stop && forward(&tx, "[DONE]".to_string()).await.is_err() {
+                    return;
+                }
+            } else if forward(&tx, ev.data).await.is_err() {
+                return;
             }
         }
         if decoder.overflowed() {
@@ -347,7 +478,13 @@ async fn pump_stream(
         }
     }
     for ev in decoder.finish() {
-        if forward(&tx, ev.data).await.is_err() {
+        if format == WireFormat::Anthropic {
+            for openai_chunk in anth_stream.push(&ev.data) {
+                if forward(&tx, openai_chunk).await.is_err() {
+                    return;
+                }
+            }
+        } else if forward(&tx, ev.data).await.is_err() {
             return;
         }
     }
@@ -395,9 +532,6 @@ fn extract_usage(body: &serde_json::Value) -> Option<Usage> {
 }
 
 fn map_reqwest_error(e: &reqwest::Error) -> TransportError {
-    // Everything that is not an explicit timeout we issued above is a
-    // connect-path failure (DNS, refused, TLS, pool). reqwest distinguishes
-    // more kinds than we route differently in v0.1, so one arm is honest.
     transport(TransportErrorKind::Connect, e.to_string())
 }
 
@@ -419,8 +553,8 @@ fn truncate_text(s: &str) -> String {
     }
 }
 
-/// Shared client builder: one pool, no implicit timeouts (budgets are
-/// enforced explicitly at every await below).
+/// Shared client builder: one pool, no implicit timeouts (budgets are enforced
+/// explicitly at every await).
 pub fn default_client() -> reqwest::Client {
     reqwest::Client::builder()
         .pool_max_idle_per_host(8)

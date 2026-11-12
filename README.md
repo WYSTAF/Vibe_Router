@@ -8,7 +8,7 @@ Vibe Router provides unified OpenAI (`/v1/chat/completions`) and Anthropic (`/v1
 
 ## Key Features
 
-- **Single Lightweight Binary**: Compiled to an ~8.8 MB standalone executable. No Node.js runtime, no Python, no external database dependencies.
+- **Single Lightweight Binary**: Compiled to a ~9.5 MB standalone executable. No Node.js runtime, no Python, no external database dependencies.
 - **Hardware-Aware Adaptive Runtime**:
   - **Disk-First VPS Mode**: Minimizes RSS footprint (< 30 MB) and restricts cache to 4 MB for small $5/mo VPS instances.
   - **RAM-First Portable Mode**: Hydrates SQLite into host memory (`:memory:`) with periodic crash-safe atomic flush back to disk, providing zero flash wear on USB drives.
@@ -40,6 +40,12 @@ Vibe Router provides unified OpenAI (`/v1/chat/completions`) and Anthropic (`/v1
   - `vibe-router mcp`: Built-in stdio Model Context Protocol (MCP) server exposing tools to external AI assistants (`vibe_router_status`, `vibe_router_costs`, `vibe_router_health`, `vibe_router_set_alias`, `vibe_router_add_proxy`).
 - **Embedded Web Dashboard**:
   - Vanilla HTML/CSS/JavaScript interface embedded via `rust-embed` with industrial dark/yellow branding (`#F5B800`), live token counters (distinguishing reported vs. estimated), USD cost & p50/p95/p99 latency metrics, combo editor, and API playground.
+  - Session-key authenticated: the dashboard stores the admin key in `sessionStorage` and sends it as `Authorization: Bearer` on every `/api/*` call. All dynamic values are rendered with safe DOM APIs (no `innerHTML` interpolation) under a strict Content-Security-Policy.
+- **Hardened Admin Boundary**:
+  - Every `/api/*` route requires the configured API key; state-mutating requests must carry `Content-Type: application/json` or `X-Vibe-Admin: 1` (CSRF guard).
+  - Runtime-created providers cannot use `env:`/`file:` secret references or shadow config-file provider IDs, and their `base_url`/proxy URLs are SSRF-guarded (loopback, link-local, and RFC1918 targets blocked unless `server.allow_local_upstreams = true`).
+- **Unified Storage**:
+  - A single SQLite owner serves both the sync request path and the async admin API under one schema (`providers`, `combos`, `aliases`, `proxies`, `rates`, `usage`), so every request is recorded exactly once and priced from one persisted rate table.
 
 ---
 
@@ -60,7 +66,7 @@ vibe-router/
     ├── vibe-router-routing/        # Fallback engine: candidate resolution, retry loop, failover driver
     ├── vibe-router-translate/      # Wire format translation (OpenAI, Anthropic /v1/messages, SSE decoders)
     ├── vibe-router-providers/      # HTTP transport, multi-key rotation pools, sticky proxies, CF relay
-    ├── vibe-router-storage/        # Async StorageBackend trait, SQLite WAL, in-memory portable hydration
+    ├── vibe-router-storage/        # Single SQLite owner (sync Store + async StorageBackend), WAL, portable hydration
     ├── vibe-router-cache/          # In-memory bounded LRU prompt & SSE stream cache with SHA-256 keys
     ├── vibe-router-ui/             # Embedded static Web UI assets (HTML/CSS/JS) via rust-embed
     ├── vibe-router-server/         # Axum server: /v1/*, /api/*, embedded dashboard, and Vibe-Link handlers

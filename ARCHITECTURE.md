@@ -3,7 +3,11 @@
 A single-binary, Rust-native LLM router: OpenAI-compatible API in, pluggable
 providers out, with health- and rate-limit-aware failover.
 
-**Status:** design only. Nothing is implemented yet.
+**Status:** implemented (v0.1). This document records the design rationale and
+the 9Router reference analysis; the workspace under `crates/` is the built
+system. Where the prose below says "v0.1 ships only X", the code has since grown
+(Anthropic tool use, tagged proxies, unified storage); the layering and the
+trait boundaries it describes still hold.
 
 ---
 

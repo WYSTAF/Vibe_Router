@@ -13,17 +13,18 @@ use axum::extract::{Path, Query, State};
 use axum::http::{header, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, post};
-use axum::{Json, Router};
+use axum::{middleware, Json, Router};
 use serde_json::{json, Value};
 use vibe_router_core::{Candidate, ModelRegistry, RouterError, UpstreamResponse};
 
 use crate::assignment::get_assignment;
+use crate::guard::{self, bearer_token, is_forbidden_runtime_secret, validate_upstream_url, CSP};
 use crate::sse;
 use crate::state::AppState;
 
-/// Extract the bearer token from an Authorization header value.
+/// Extract the bearer token from an Authorization header value (case-insensitive).
 fn bearer(auth: &str) -> Option<&str> {
-    auth.strip_prefix("Bearer ").map(str::trim)
+    bearer_token(auth)
 }
 
 // ---------------------------------------------------------------- /v1
@@ -80,21 +81,14 @@ pub async fn chat_completions(
         routed_body["_vibe_retry"] = Value::Bool(true);
     }
 
-    // Cache lookup: keyed by (model, temperature, top_p, tools, messages).
+    // Cache lookup keyed by the full response-shaping surface of the request.
     // Bypassed if X-Vibe-Retry: 1 or Cache-Control: no-cache.
     let streaming = body.get("stream").and_then(Value::as_bool).unwrap_or(false);
-    let temperature = body.get("temperature").and_then(Value::as_f64);
-    let top_p = body.get("top_p").and_then(Value::as_f64);
-    let tools = body.get("tools");
-    let messages = body.get("messages").cloned().unwrap_or(Value::Null);
 
     let cache_key = if !streaming && state.cache_enabled && !is_retry {
-        Some(vibe_router_cache::compute_cache_key(
+        Some(vibe_router_cache::compute_request_cache_key(
             &requested_model,
-            temperature,
-            top_p,
-            tools,
-            &messages,
+            &body,
         ))
     } else {
         None
@@ -102,12 +96,9 @@ pub async fn chat_completions(
 
     let stream_cache_key =
         if streaming && state.cache_enabled && state.stream_cache_enabled && !is_retry {
-            Some(vibe_router_cache::compute_cache_key(
+            Some(vibe_router_cache::compute_request_cache_key(
                 &requested_model,
-                temperature,
-                top_p,
-                tools,
-                &messages,
+                &body,
             ))
         } else {
             None
@@ -116,6 +107,7 @@ pub async fn chat_completions(
     if let Some(key) = &cache_key {
         if let Some(hit) = state.cache.get(key) {
             tracing::info!(model = %requested_model, "cache HIT");
+            record_cache_hit(&state, &requested_model, false, hit.usage, role.clone()).await;
             let mut resp = (StatusCode::OK, Json(hit.body)).into_response();
             attach_telemetry_headers(&mut resp, 0, 0, true, "cache");
             return resp;
@@ -125,6 +117,7 @@ pub async fn chat_completions(
     if let Some(key) = &stream_cache_key {
         if let Some(hit) = state.cache.get_stream(key) {
             tracing::info!(model = %requested_model, "stream cache HIT");
+            record_cache_hit(&state, &requested_model, true, hit.usage, role.clone()).await;
             let stream = futures_util::stream::iter(
                 hit.frames
                     .into_iter()
@@ -183,12 +176,7 @@ pub async fn chat_completions(
                     routed.fell_back_past as u32,
                     role,
                 );
-                state.store.append(rec.clone());
-                let b = state.backend.clone();
-                let rec_clone = rec.clone();
-                tokio::spawn(async move {
-                    let _ = b.record_usage(&rec_clone).await;
-                });
+                let cost = state.record_usage(rec).await;
                 state
                     .health
                     .record_provider_latency(&provider, started.elapsed().as_millis() as u64);
@@ -201,7 +189,7 @@ pub async fn chat_completions(
                 );
                 let latency_ms = started.elapsed().as_millis() as u64;
                 let mut resp = (StatusCode::OK, Json(resp_body)).into_response();
-                attach_telemetry_headers(&mut resp, rec.cost_micros, latency_ms, false, &provider);
+                attach_telemetry_headers(&mut resp, cost, latency_ms, false, &provider);
                 return resp;
             }
 
@@ -243,9 +231,7 @@ pub async fn chat_completions(
                     failovers,
                     role_clone,
                 );
-                state2.store.append(rec.clone());
-                let b = state2.backend.clone();
-                let _ = b.record_usage(&rec).await;
+                let _ = state2.record_usage(rec).await;
                 state2
                     .health
                     .record_provider_latency(&provider_echo, started2.elapsed().as_millis() as u64);
@@ -263,17 +249,19 @@ pub async fn chat_completions(
         }
         Err(err) => {
             let status = err.status();
-            state.store.append(record_for(
-                &requested_model,
-                &Candidate::direct(&requested_model),
-                "",
-                status,
-                false,
-                &vibe_router_core::Usage::default(),
-                started,
-                0,
-                role,
-            ));
+            state
+                .record_usage(record_for(
+                    &requested_model,
+                    &Candidate::direct(&requested_model),
+                    "",
+                    status,
+                    false,
+                    &vibe_router_core::Usage::default(),
+                    started,
+                    0,
+                    role,
+                ))
+                .await;
             error_response(&err)
         }
     }
@@ -356,12 +344,9 @@ pub async fn anthropic_messages(
         .map(|s| s.to_string());
 
     let cache_key = if !streaming && state.cache_enabled && !is_retry {
-        Some(vibe_router_cache::compute_cache_key(
+        Some(vibe_router_cache::compute_request_cache_key(
             &requested_model,
-            body.get("temperature").and_then(Value::as_f64),
-            body.get("top_p").and_then(Value::as_f64),
-            body.get("tools"),
-            &routed_body.get("messages").cloned().unwrap_or(Value::Null),
+            &routed_body,
         ))
     } else {
         None
@@ -370,6 +355,7 @@ pub async fn anthropic_messages(
     if let Some(key) = &cache_key {
         if let Some(hit) = state.cache.get(key) {
             tracing::info!(model = %requested_model, "Anthropic cache HIT");
+            record_cache_hit(&state, &requested_model, false, hit.usage, role.clone()).await;
             let anthropic_resp =
                 vibe_router_translate::openai_to_anthropic_response(&hit.body, &requested_model);
             let mut resp = (StatusCode::OK, Json(anthropic_resp)).into_response();
@@ -411,12 +397,7 @@ pub async fn anthropic_messages(
                         routed.fell_back_past as u32,
                         role,
                     );
-                    state.store.append(rec.clone());
-                    let b = state.backend.clone();
-                    let rec_clone = rec.clone();
-                    tokio::spawn(async move {
-                        let _ = b.record_usage(&rec_clone).await;
-                    });
+                    let cost = state.record_usage(rec).await;
                     state
                         .health
                         .record_provider_latency(&provider, started.elapsed().as_millis() as u64);
@@ -427,13 +408,7 @@ pub async fn anthropic_messages(
                     );
                     let latency_ms = started.elapsed().as_millis() as u64;
                     let mut resp = (StatusCode::OK, Json(anthropic_resp)).into_response();
-                    attach_telemetry_headers(
-                        &mut resp,
-                        rec.cost_micros,
-                        latency_ms,
-                        false,
-                        &provider,
-                    );
+                    attach_telemetry_headers(&mut resp, cost, latency_ms, false, &provider);
                     resp
                 }
                 UpstreamResponse::Stream { mut events, .. } => {
@@ -498,9 +473,7 @@ pub async fn anthropic_messages(
                             failovers,
                             role_clone,
                         );
-                        state2.store.append(rec.clone());
-                        let b = state2.backend.clone();
-                        let _ = b.record_usage(&rec).await;
+                        let _ = state2.record_usage(rec).await;
                         state2.health.record_provider_latency(
                             &provider_echo,
                             started2.elapsed().as_millis() as u64,
@@ -561,6 +534,33 @@ pub(crate) fn check_auth(
     }
 }
 
+/// Record a cache hit as a zero-cost usage row so dashboards and totals reflect
+/// cached traffic. `cached = true` keeps it distinct from a reported upstream
+/// response, and pricing forces cost to zero.
+async fn record_cache_hit(
+    state: &Arc<AppState>,
+    requested: &str,
+    streamed: bool,
+    usage: Option<vibe_router_core::Usage>,
+    role: Option<String>,
+) {
+    let usage = usage.unwrap_or_default();
+    let rec = vibe_router_storage::UsageRecord {
+        requested_model: requested.to_string(),
+        served_model: "cache".to_string(),
+        provider: "cache".to_string(),
+        status: 200,
+        streamed,
+        prompt_tokens: usage.prompt_tokens,
+        completion_tokens: usage.completion_tokens,
+        usage_estimated: usage.estimated,
+        cached: true,
+        role,
+        ..vibe_router_storage::UsageRecord::default()
+    };
+    let _ = state.record_usage(rec).await;
+}
+
 #[allow(clippy::too_many_arguments)]
 fn record_for(
     requested: &str,
@@ -573,19 +573,8 @@ fn record_for(
     failovers: u32,
     role: Option<String>,
 ) -> vibe_router_storage::UsageRecord {
-    let rates = vibe_router_storage::Rates::default_frontier_rates();
-    let model_bare = candidate
-        .model
-        .split_once('/')
-        .map(|(_, m)| m)
-        .unwrap_or(&candidate.model);
-    let cost = rates
-        .get(model_bare)
-        .or_else(|| rates.get(&candidate.model))
-        .or_else(|| rates.get(requested))
-        .map(|r| r.cost_micros(usage.prompt_tokens, usage.completion_tokens))
-        .unwrap_or(0);
-
+    // Cost is priced once by the storage owner against the persisted rate
+    // table (see `AppState::record_usage`); the row starts unpriced here.
     vibe_router_storage::UsageRecord {
         requested_model: requested.to_string(),
         served_model: candidate.model.clone(),
@@ -598,7 +587,6 @@ fn record_for(
         usage_estimated: usage.estimated,
         latency: started.elapsed(),
         failovers,
-        cost_micros: cost,
         role,
         ..vibe_router_storage::UsageRecord::default()
     }
@@ -702,6 +690,7 @@ pub async fn api_status(State(state): State<Arc<AppState>>) -> Response {
     let health = state.health.snapshot();
     let cfg_auth = state.auth.lock().enabled();
     let registry = state.registry.clone();
+    state.sqlite.flush().await;
     let totals = state.store.totals().unwrap_or_default();
 
     let mut providers = Vec::new();
@@ -875,6 +864,37 @@ pub async fn api_provider_create(
         return bad_request("base_url must start with http:// or https://");
     }
 
+    // A runtime provider must not shadow a trusted config-file provider by id.
+    if state.registry.is_file_provider(&id) {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(json!({"error": {"message": format!(
+                "provider `{id}` is declared in the config file and cannot be overridden at runtime"
+            )}})),
+        )
+            .into_response();
+    }
+
+    // Runtime secrets must be literals: `env:`/`file:` references would let an
+    // attacker exfiltrate host secrets to a chosen base_url.
+    if let Some(secret) = &input.auth_secret {
+        if is_forbidden_runtime_secret(secret) {
+            return bad_request("runtime providers cannot use `env:` or `file:` secret references");
+        }
+    }
+    if input
+        .api_keys
+        .iter()
+        .any(|k| is_forbidden_runtime_secret(k))
+    {
+        return bad_request("runtime api_keys cannot use `env:` or `file:` secret references");
+    }
+
+    // SSRF guard on the upstream target.
+    if let Err(e) = validate_upstream_url(&base_url, state.allow_local_upstreams()) {
+        return bad_request(&e);
+    }
+
     let rp = vibe_router_storage::RuntimeProvider {
         id: id.clone(),
         display_name: input.display_name.clone(),
@@ -898,16 +918,27 @@ pub async fn api_provider_create(
         passthrough: input.passthrough,
     };
 
+    // Persist first; only publish to the live registry once durable, so a
+    // storage failure surfaces as a real error instead of a phantom 201.
+    if let Err(e) = state.store.upsert_provider(&rp) {
+        return persistence_error(&e.to_string());
+    }
     let p_cfg = crate::state::provider_from_runtime(&rp);
     let config_provider = vibe_router_providers::build_provider(&p_cfg);
     state.registry.set_runtime_provider(config_provider);
-    if let Err(e) = state.store.upsert_provider(&rp) {
-        tracing::warn!("provider registered in memory but failed to persist: {e}");
-    }
+    state.cache.purge();
     tracing::info!(provider = %id, "runtime provider saved");
     (
         StatusCode::CREATED,
         Json(json!({"id": id, "status": "saved"})),
+    )
+        .into_response()
+}
+
+fn persistence_error(msg: &str) -> Response {
+    (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        Json(json!({"error": {"message": format!("persistence failed: {msg}"), "type": "server_error"}})),
     )
         .into_response()
 }
@@ -990,24 +1021,24 @@ pub async fn api_combo_create(
             }
         }
     }
-    let combo = vibe_router_core::Combo {
-        name: name.clone(),
-        description: input.description.clone(),
-        models: input.models.clone(),
-        strategy: Default::default(),
-    };
-    registry.set_runtime_combo(combo.clone());
-    // Persist so the combo survives a restart.
+    // Persist the trimmed name first; only publish once durable.
     if let Err(e) = state
         .store
         .upsert_combo(&vibe_router_storage::RuntimeCombo {
-            name: input.name.clone(),
+            name: name.clone(),
             description: input.description.clone(),
             models: input.models.clone(),
         })
     {
-        tracing::warn!("combo persisted in memory but not to storage: {e}");
+        return persistence_error(&e.to_string());
     }
+    registry.set_runtime_combo(vibe_router_core::Combo {
+        name: name.clone(),
+        description: input.description.clone(),
+        models: input.models.clone(),
+        strategy: Default::default(),
+    });
+    state.cache.purge();
     tracing::info!(combo = %name, "runtime combo saved");
     (StatusCode::CREATED, Json(json!({"name": name}))).into_response()
 }
@@ -1057,6 +1088,7 @@ pub async fn api_usage_recent(
         .and_then(|v| v.parse::<u32>().ok())
         .unwrap_or(50)
         .min(500);
+    state.sqlite.flush().await;
     match state.store.recent(limit) {
         Ok(rows) => {
             let data: Vec<Value> = rows
@@ -1093,6 +1125,7 @@ pub async fn api_usage_recent(
 
 /// `GET /api/usage/totals`
 pub async fn api_usage_totals(State(state): State<Arc<AppState>>) -> Response {
+    state.sqlite.flush().await;
     match state.store.totals() {
         Ok(t) => Json(json!({
             "requests": t.requests,
@@ -1168,10 +1201,20 @@ pub async fn api_alias_create(
     if alias.is_empty() || target.is_empty() {
         return bad_request("alias and target cannot be empty");
     }
-    state.registry.set_alias(alias.clone(), target.clone());
-    if let Err(e) = state.backend.save_alias(&alias, &target).await {
-        tracing::warn!("failed to persist alias: {e}");
+    if alias.contains('/') {
+        return bad_request("alias names cannot contain `/`");
     }
+    // The target must resolve to a real model, combo, or alias chain.
+    if state.registry.resolve(&target).is_err() {
+        return bad_request(&format!(
+            "alias target `{target}` does not resolve to a known model or combo"
+        ));
+    }
+    if let Err(e) = state.backend.save_alias(&alias, &target).await {
+        return persistence_error(&e.to_string());
+    }
+    state.registry.set_alias(alias.clone(), target.clone());
+    state.cache.purge();
     tracing::info!(alias = %alias, target = %target, "alias registered");
     (
         StatusCode::CREATED,
@@ -1185,8 +1228,11 @@ pub async fn api_alias_delete(
     State(state): State<Arc<AppState>>,
     Path(alias): Path<String>,
 ) -> Response {
+    if let Err(e) = state.backend.delete_alias(&alias).await {
+        return persistence_error(&e.to_string());
+    }
     state.registry.remove_alias(&alias);
-    let _ = state.backend.delete_alias(&alias).await;
+    state.cache.purge();
     StatusCode::NO_CONTENT.into_response()
 }
 
@@ -1224,13 +1270,25 @@ pub async fn api_proxy_create(
         Ok(t) => t,
         Err(e) => return bad_request(&e),
     };
+    let id = input.id.trim().to_string();
+    let url = input.url.trim().to_string();
+    if id.is_empty() {
+        return bad_request("proxy id is required");
+    }
+    if let Err(e) = validate_upstream_url(&url, state.allow_local_upstreams()) {
+        return bad_request(&e);
+    }
     let proxy = vibe_router_providers::ProxyEntry {
-        id: input.id.trim().to_string(),
-        url: input.url.trim().to_string(),
+        id: id.clone(),
+        url,
         tag,
         enabled: input.enabled,
         weight: input.weight.max(1),
     };
+    let record = crate::state::proxy_record_from_entry(&proxy);
+    if let Err(e) = state.backend.save_proxy(&record).await {
+        return persistence_error(&e.to_string());
+    }
     state.registry.proxies().add(proxy.clone());
     (StatusCode::CREATED, Json(json!({"proxy": proxy}))).into_response()
 }
@@ -1240,6 +1298,9 @@ pub async fn api_proxy_delete(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
 ) -> Response {
+    if let Err(e) = state.backend.delete_proxy(&id).await {
+        return persistence_error(&e.to_string());
+    }
     state.registry.proxies().remove(&id);
     StatusCode::NO_CONTENT.into_response()
 }
@@ -1277,38 +1338,54 @@ fn serve_asset(data: impl AsRef<[u8]>, mime: &'static str) -> Response {
     let mut resp = Response::new(Body::from(bytes));
     resp.headers_mut()
         .insert(header::CONTENT_TYPE, HeaderValue::from_static(mime));
+    resp.headers_mut().insert(
+        header::CONTENT_SECURITY_POLICY,
+        HeaderValue::from_static(CSP),
+    );
+    resp.headers_mut().insert(
+        header::X_CONTENT_TYPE_OPTIONS,
+        HeaderValue::from_static("nosniff"),
+    );
     resp
 }
 
 // ---------------------------------------------------------------- router
 
 pub fn router(state: Arc<AppState>) -> Router {
+    // Every /api/* route sits behind authentication + CSRF middleware. The
+    // dashboard supplies the session key as a Bearer token.
+    let api = Router::new()
+        .route("/assignment", get(get_assignment))
+        .route("/status", get(api_status))
+        .route("/providers", get(api_providers).post(api_provider_create))
+        .route("/providers/:id", delete(api_provider_delete))
+        .route("/combos", get(api_combos).post(api_combo_create))
+        .route("/combos/:name", delete(api_combo_delete))
+        .route("/aliases", get(api_aliases_list).post(api_alias_create))
+        .route("/aliases/:alias", delete(api_alias_delete))
+        .route("/proxies", get(api_proxies_list).post(api_proxy_create))
+        .route("/proxies/:id", delete(api_proxy_delete))
+        .route("/relay/worker.js", get(api_relay_worker_script))
+        .route("/costs", get(api_costs))
+        .route("/health", get(api_health))
+        .route("/usage/recent", get(api_usage_recent))
+        .route("/usage/totals", get(api_usage_totals))
+        .route("/cache/stats", get(api_cache_stats))
+        .route("/cache/purge", post(api_cache_purge))
+        .route_layer(middleware::from_fn_with_state(
+            state.clone(),
+            guard::admin_auth,
+        ));
+
     Router::new()
         .route("/v1/chat/completions", post(chat_completions))
         .route("/v1/messages", post(anthropic_messages))
         .route("/v1/models", get(models))
         .route("/v1/assignment", get(get_assignment))
-        .route("/api/assignment", get(get_assignment))
-        .route("/api/status", get(api_status))
-        .route(
-            "/api/providers",
-            get(api_providers).post(api_provider_create),
-        )
-        .route("/api/providers/:id", delete(api_provider_delete))
-        .route("/api/combos", get(api_combos).post(api_combo_create))
-        .route("/api/combos/:name", delete(api_combo_delete))
-        .route("/api/aliases", get(api_aliases_list).post(api_alias_create))
-        .route("/api/aliases/:alias", delete(api_alias_delete))
-        .route("/api/proxies", get(api_proxies_list).post(api_proxy_create))
-        .route("/api/proxies/:id", delete(api_proxy_delete))
-        .route("/api/relay/worker.js", get(api_relay_worker_script))
-        .route("/api/costs", get(api_costs))
-        .route("/api/health", get(api_health))
-        .route("/api/usage/recent", get(api_usage_recent))
-        .route("/api/usage/totals", get(api_usage_totals))
-        .route("/api/cache/stats", get(api_cache_stats))
-        .route("/api/cache/purge", post(api_cache_purge))
+        .nest("/api", api)
         .route("/", get(dashboard))
         .route("/*path", get(asset))
+        // Vision payloads (base64 images) need headroom above axum's 2MB default.
+        .layer(axum::extract::DefaultBodyLimit::max(32 * 1024 * 1024))
         .with_state(state)
 }

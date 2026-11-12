@@ -12,3 +12,6 @@ serde = { version = "1", features = ["derive"] }
 serde_json.workspace = true
 async-trait = "0.1"
 tokio = { version = "1", default-features = false, features = ["sync"] }
+# Real physical-RAM detection across platforms (GlobalMemoryStatusEx on Windows,
+# sysctl hw.memsize on macOS, /proc/meminfo on Linux) without unsafe code here.
+sysinfo = { version = "0.32", default-features = false, features = ["system"] }

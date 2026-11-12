@@ -39,6 +39,14 @@ pub struct Routed {
     pub fell_back_past: usize,
 }
 
+/// A failed candidate attempt: the client-facing error plus the *upstream*
+/// status that produced it, so the chain can surface an accurate terminal code
+/// (429/401/403) rather than the router's 502/503 wrapper.
+struct AttemptFailure {
+    status: u16,
+    err: RouterError,
+}
+
 /// The router. Generic over the concrete implementations the server wires in.
 pub struct Router<R, H, C, U>
 where
@@ -123,55 +131,64 @@ where
 
         let deadline = Instant::now() + self.policy.request_budget;
         let mut reopen: Option<Instant> = None;
+        // The terminal *upstream* status (not the router's wrapper status), so
+        // a chain that ends in 429/401/403 surfaces that code, not 502/503.
         let mut last_status: u16 = 0;
         let mut last_detail = String::from("no candidate was available");
+        let mut attempted: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut fell_back_past = 0usize;
 
         for pass in 0..2u32 {
-            let mut reserved: Vec<Candidate> = Vec::with_capacity(candidates.len());
             reopen = None;
+            let mut attempted_any = false;
 
             for cand in &candidates {
-                if Instant::now() >= deadline {
-                    break;
-                }
-                match self.health.reserve(cand) {
-                    Usability::Ready => reserved.push(cand.clone()),
-                    Usability::Cooldown(t) | Usability::RateLimited(t) => {
-                        reopen = Some(match reopen {
-                            Some(x) => x.min(t),
-                            None => t,
-                        });
-                    }
-                }
-            }
-
-            for (i, cand) in reserved.iter().enumerate() {
                 if Instant::now() >= deadline {
                     last_status = 504;
                     last_detail = "request budget exhausted".to_string();
                     break;
                 }
+                // On the retry pass, skip candidates already attempted so an
+                // RPM slot is never charged twice for the same request.
+                if pass > 0 && attempted.contains(&cand.model) {
+                    continue;
+                }
+                // Lazy reservation: a slot is consumed only when we are about
+                // to execute this candidate, never upfront for the whole chain.
+                match self.health.reserve(cand) {
+                    Usability::Ready => {}
+                    Usability::Cooldown(t) | Usability::RateLimited(t) => {
+                        reopen = Some(match reopen {
+                            Some(x) => x.min(t),
+                            None => t,
+                        });
+                        continue;
+                    }
+                }
+
+                attempted.insert(cand.model.clone());
+                attempted_any = true;
                 match self.attempt(cand, &body, stream, deadline).await {
                     Ok(mut routed) => {
-                        routed.fell_back_past = i;
+                        routed.fell_back_past = fell_back_past;
                         return Ok(routed);
                     }
                     // A client error stops the chain: the next provider would
                     // see the same bad request, so do not punish them for it.
-                    Err(err @ RouterError::Upstream { .. }) => return Err(err),
-                    Err(err) => {
-                        last_status = err.status();
-                        last_detail = err.message();
-                        tracing::warn!(candidate = %cand, "falling over: {err}");
+                    Err(f) if matches!(f.err, RouterError::Upstream { .. }) => return Err(f.err),
+                    Err(f) => {
+                        last_status = f.status;
+                        last_detail = f.err.message();
+                        fell_back_past += 1;
+                        tracing::warn!(candidate = %cand, "falling over: {}", f.err);
                     }
                 }
             }
 
-            // Nothing succeeded. If every candidate was blocked only by a
-            // rate-limit window that reopens inside the budget, wait rather
-            // than returning 429 — that is "wait instead of provoking"
-            // applied across the whole chain.
-            if pass == 0 {
+            // Nothing succeeded. Only wait-and-retry when *no* candidate could
+            // be attempted (all blocked) and a window reopens inside the budget
+            // — "wait instead of provoking", scoped to the remaining budget.
+            if pass == 0 && !attempted_any {
                 if let Some(until) = reopen {
                     let wait = until.saturating_duration_since(Instant::now());
                     if !wait.is_zero() && Instant::now() + wait < deadline {
@@ -189,6 +206,13 @@ where
                 requested,
                 retry_after_secs: self.retry_after(&candidates),
                 detail: last_detail,
+            });
+        }
+        // Preserve account-scoped terminal statuses instead of masking them.
+        if last_status == 401 || last_status == 403 {
+            return Err(RouterError::Upstream {
+                status: last_status,
+                message: last_detail,
             });
         }
         // Propagate a chain-wide timeout as 504 — masking it as 503 would
@@ -213,25 +237,39 @@ where
         body: &serde_json::Value,
         stream: bool,
         deadline: Instant,
-    ) -> RouterResult<Routed> {
-        let (provider, upstream_model) =
-            split_model(&cand.model).ok_or_else(|| RouterError::ModelNotFound {
-                requested: cand.model.clone(),
-                detail: "malformed `provider/model` id".into(),
-            })?;
+    ) -> Result<Routed, AttemptFailure> {
+        let (provider, upstream_model) = match split_model(&cand.model) {
+            Some(parts) => parts,
+            None => {
+                return Err(AttemptFailure {
+                    status: 404,
+                    err: RouterError::ModelNotFound {
+                        requested: cand.model.clone(),
+                        detail: "malformed `provider/model` id".into(),
+                    },
+                });
+            }
+        };
 
         // Rewrite the model id for the upstream; the server layer restores the
-        // client's own string in the response body.
+        // client's own string in the response body. Strip the internal
+        // judge-retry marker so it never leaks to the provider.
         let mut upstream_body = body.clone();
         upstream_body["model"] = serde_json::Value::String(upstream_model.to_string());
+        if let Some(obj) = upstream_body.as_object_mut() {
+            obj.remove("_vibe_retry");
+        }
 
+        // Bound this attempt by the remaining request budget so a slow upstream
+        // cannot overrun the client's total deadline.
+        let remaining = deadline.saturating_duration_since(Instant::now());
         let req = UpstreamRequest {
             provider_id: provider.to_string(),
             model: upstream_model.to_string(),
             body: upstream_body,
             stream,
-            connect_timeout: self.policy.connect_timeout,
-            first_chunk_timeout: self.policy.first_chunk_timeout,
+            connect_timeout: self.policy.connect_timeout.min(remaining),
+            first_chunk_timeout: self.policy.first_chunk_timeout.min(remaining),
             chunk_stall_timeout: self.policy.chunk_stall_timeout,
         };
 
@@ -310,22 +348,31 @@ where
         self.health.record(cand, outcome.clone());
 
         match outcome {
-            Outcome::ClientError { status } => Err(RouterError::Upstream {
+            Outcome::ClientError { status } => Err(AttemptFailure {
                 status,
-                message: truncate(&detail),
+                err: RouterError::Upstream {
+                    status,
+                    message: truncate(&detail),
+                },
             }),
-            Outcome::TimedOut => Err(RouterError::Timeout {
-                requested: cand.model.clone(),
-                detail: truncate(&detail),
+            Outcome::TimedOut => Err(AttemptFailure {
+                status: 504,
+                err: RouterError::Timeout {
+                    requested: cand.model.clone(),
+                    detail: truncate(&detail),
+                },
             }),
-            Outcome::Fallback(f) => Err(RouterError::BadGateway {
-                provider: provider.to_string(),
-                detail: format!(
-                    "{} (upstream {}): {}",
-                    cand.model,
-                    f.status,
-                    truncate(&detail)
-                ),
+            Outcome::Fallback(f) => Err(AttemptFailure {
+                status: f.status,
+                err: RouterError::BadGateway {
+                    provider: provider.to_string(),
+                    detail: format!(
+                        "{} (upstream {}): {}",
+                        cand.model,
+                        f.status,
+                        truncate(&detail)
+                    ),
+                },
             }),
             Outcome::Success => unreachable!("a success returns before classification"),
         }
