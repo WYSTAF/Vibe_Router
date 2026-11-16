@@ -501,3 +501,168 @@ async fn key_pool_reports_health_and_count() {
     assert_eq!(prov.key_pool.healthy_keys(), 2);
     assert!(prov.key_pool.earliest_cooldown().is_some());
 }
+
+// ---------------------------------------------------------------- auth-fault rotation
+
+const OK_JSON: &str = r#"{"id":"c1","choices":[{"message":{"content":"hi"}}],"usage":{"prompt_tokens":1,"completion_tokens":1}}"#;
+
+/// A 401 on the first pooled key rotates to the next healthy key (non-streaming),
+/// and the bad key stays cooled on subsequent requests.
+#[tokio::test]
+async fn auth_fault_401_rotates_and_cools_key_non_streaming() {
+    let mut mock = MockUpstream::sequence(vec![
+        crate::mock::Reply::Json(401, r#"{"error":{"message":"invalid key"}}"#.into()),
+        crate::mock::Reply::Json(200, OK_JSON.into()),
+    ])
+    .await;
+    let p = pooled_provider("mock", &mock.url(), vec!["sk-bad", "sk-ok"]);
+    let upstream = HttpUpstream::new(registry_for(p));
+
+    let resp = upstream
+        .execute(req("mock", false, Duration::from_secs(5)))
+        .await;
+    assert!(
+        matches!(resp, UpstreamResponse::Json { status: 200, .. }),
+        "{resp:?}"
+    );
+    assert!(mock.request_text(0).await.contains("Bearer sk-bad"));
+    assert!(mock.request_text(1).await.contains("Bearer sk-ok"));
+
+    // Bad key is cooling: the next request goes straight to the healthy key.
+    let resp2 = upstream
+        .execute(req("mock", false, Duration::from_secs(5)))
+        .await;
+    assert!(matches!(resp2, UpstreamResponse::Json { status: 200, .. }));
+    assert!(mock.request_text(2).await.contains("Bearer sk-ok"));
+}
+
+/// Same rotation for a 403 key fault.
+#[tokio::test]
+async fn auth_fault_403_rotates_to_next_key() {
+    let mut mock = MockUpstream::sequence(vec![
+        crate::mock::Reply::Json(403, r#"{"error":{"message":"forbidden"}}"#.into()),
+        crate::mock::Reply::Json(200, OK_JSON.into()),
+    ])
+    .await;
+    let p = pooled_provider("mock", &mock.url(), vec!["sk-bad", "sk-ok"]);
+    let upstream = HttpUpstream::new(registry_for(p));
+    let resp = upstream
+        .execute(req("mock", false, Duration::from_secs(5)))
+        .await;
+    assert!(
+        matches!(resp, UpstreamResponse::Json { status: 200, .. }),
+        "{resp:?}"
+    );
+    assert!(mock.request_text(1).await.contains("Bearer sk-ok"));
+}
+
+/// A pre-SSE 401 on a streaming request rotates keys too (error arrives as Json).
+#[tokio::test]
+async fn auth_fault_rotates_on_streaming_path() {
+    let chunks = vec![
+        "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\n".to_string(),
+        "data: [DONE]\n\n".to_string(),
+    ];
+    let mut mock = MockUpstream::sequence(vec![
+        crate::mock::Reply::Json(401, r#"{"error":{"message":"invalid key"}}"#.into()),
+        crate::mock::Reply::Sse {
+            chunks,
+            silence: None,
+        },
+    ])
+    .await;
+    let p = pooled_provider("mock", &mock.url(), vec!["sk-bad", "sk-ok"]);
+    let upstream = HttpUpstream::new(registry_for(p));
+
+    let resp = upstream
+        .execute(req("mock", true, Duration::from_secs(5)))
+        .await;
+    match resp {
+        UpstreamResponse::Stream { mut events, .. } => {
+            let mut done = false;
+            while let Some(ev) = events.recv().await {
+                if matches!(ev, StreamEvent::Done) {
+                    done = true;
+                    break;
+                }
+            }
+            assert!(
+                done,
+                "stream should complete after rotating to the healthy key"
+            );
+        }
+        other => panic!("expected Stream after rotation, got {other:?}"),
+    }
+    assert!(mock.request_text(0).await.contains("Bearer sk-bad"));
+    assert!(mock.request_text(1).await.contains("Bearer sk-ok"));
+}
+
+/// When every key returns 401, the last 401 surfaces immediately (no 120s wait).
+#[tokio::test]
+async fn all_keys_auth_fault_surfaces_fast() {
+    let mock = MockUpstream::json(
+        401,
+        "Unauthorized",
+        r#"{"error":{"message":"invalid key"}}"#,
+    )
+    .await;
+    let p = pooled_provider("mock", &mock.url(), vec!["bad1", "bad2"]);
+    let upstream = HttpUpstream::new(registry_for(p));
+
+    let start = std::time::Instant::now();
+    let resp = upstream
+        .execute(req("mock", false, Duration::from_secs(5)))
+        .await;
+    let elapsed = start.elapsed();
+    assert!(
+        matches!(resp, UpstreamResponse::Json { status: 401, .. }),
+        "{resp:?}"
+    );
+    assert!(
+        elapsed < Duration::from_secs(2),
+        "must not wait out a cooldown: {elapsed:?}"
+    );
+}
+
+/// Request-scoped errors (400/422) fail fast without rotating keys.
+#[tokio::test]
+async fn request_error_does_not_rotate_keys() {
+    for status in [400u16, 422] {
+        let mock = MockUpstream::json(
+            status,
+            "Bad Request",
+            r#"{"error":{"message":"bad input"}}"#,
+        )
+        .await;
+        let p = pooled_provider("mock", &mock.url(), vec!["k1", "k2"]);
+        let upstream = HttpUpstream::new(registry_for(p));
+        let resp = upstream
+            .execute(req("mock", false, Duration::from_secs(5)))
+            .await;
+        assert!(
+            matches!(resp, UpstreamResponse::Json { status: s, .. } if s == status),
+            "{resp:?}"
+        );
+        // Exactly one upstream call: no key rotation on a request fault.
+        assert_eq!(mock.wait_for_requests(1).await, 1);
+        assert_eq!(mock.request_count(), 1);
+    }
+}
+
+/// An auth-failed key receives the long auth cooldown (default 30 minutes).
+#[tokio::test]
+async fn auth_fault_key_gets_long_cooldown() {
+    let p = pooled_provider("mock", "http://x.invalid", vec!["k1", "k2"]);
+    let reg = registry_for(p);
+    let prov = reg.provider("mock").unwrap();
+    prov.key_pool.mark_auth_fault(0);
+    assert_eq!(prov.key_pool.healthy_keys(), 1);
+    let cd = prov.key_pool.earliest_cooldown().unwrap();
+    assert!(
+        cd >= Duration::from_secs(1700),
+        "auth cooldown should be ~30m, got {cd:?}"
+    );
+    // Successful use clears it.
+    prov.key_pool.mark_success(0);
+    assert_eq!(prov.key_pool.healthy_keys(), 2);
+}

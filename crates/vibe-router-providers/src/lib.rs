@@ -300,7 +300,13 @@ fn merge_combos(
 pub fn build_provider(p: &ProviderConfig) -> ConfigProvider {
     let auth = p.auth();
     let key_pool = match auth.key_pool() {
-        Some(kp) => ProviderKeyPool::new(kp.keys.clone(), kp.strategy),
+        Some(kp) => {
+            let mut pool = ProviderKeyPool::new(kp.keys.clone(), kp.strategy);
+            if let Some(ms) = p.auth.auth_cooldown_ms {
+                pool = pool.with_auth_cooldown(std::time::Duration::from_millis(ms));
+            }
+            pool
+        }
         None => ProviderKeyPool::empty(),
     };
     ConfigProvider {

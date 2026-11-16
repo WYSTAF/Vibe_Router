@@ -2321,3 +2321,118 @@ async fn cf_worker_proxy_relays_with_target_header() {
     let req = mock.request_text(0).await;
     assert!(req.to_ascii_lowercase().contains("x-target-url"), "{req}");
 }
+
+// ============================================================================
+// Bug 1: key-scoped auth-fault rotation
+// ============================================================================
+
+/// A single provider "good" with a pool of literal keys (no combo).
+fn pooled_cfg(url: &str, keys: Vec<&str>) -> AppConfig {
+    let mut cfg = AppConfig::minimal();
+    cfg.cache.enabled = false;
+    cfg.router.cache.enabled = false;
+    cfg.providers = vec![ProviderConfig {
+        id: "good".into(),
+        display_name: None,
+        base_url: url.into(),
+        format: Default::default(),
+        auth: AuthConfig {
+            scheme: Default::default(),
+            secret: String::new(),
+            secrets: keys.into_iter().map(String::from).collect(),
+            ..Default::default()
+        },
+        api_keys: vec![],
+        key_strategy: None,
+        headers: vec![],
+        models: vec![ModelConfig {
+            id: "m".into(),
+            name: None,
+            context: None,
+            max_output: None,
+        }],
+        passthrough: false,
+    }];
+    cfg.router.providers = cfg.providers.clone();
+    cfg
+}
+
+#[tokio::test]
+async fn pool_auth_fault_rotates_to_healthy_key_e2e() {
+    let mock = MockUpstream::sequence(vec![
+        Reply::Json(401, r#"{"error":{"message":"invalid key"}}"#.into()),
+        Reply::Json(200, OK_BODY.to_string()),
+    ])
+    .await;
+    let (base, _state) = spawn_server(&pooled_cfg(&mock.url(), vec!["sk-bad", "sk-ok"])).await;
+    let resp = client()
+        .post(format!("{base}/v1/chat/completions"))
+        .json(&serde_json::json!({"model":"good/m","messages":[{"role":"user","content":"hi"}]}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        200,
+        "a bad key must rotate, not fail the request"
+    );
+}
+
+#[tokio::test]
+async fn pool_auth_fault_rotates_streaming_e2e() {
+    let mock = MockUpstream::sequence(vec![
+        Reply::Json(401, r#"{"error":{"message":"invalid key"}}"#.into()),
+        Reply::Sse {
+            chunks: sse_chunks(),
+            silence: None,
+        },
+    ])
+    .await;
+    let (base, _state) = spawn_server(&pooled_cfg(&mock.url(), vec!["sk-bad", "sk-ok"])).await;
+    let resp = client()
+        .post(format!("{base}/v1/chat/completions"))
+        .json(&serde_json::json!({"model":"good/m","stream":true,"messages":[{"role":"user","content":"hi"}]}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let body = resp.text().await.unwrap();
+    assert!(body.contains("[DONE]"), "{body}");
+}
+
+#[tokio::test]
+async fn pool_all_auth_faults_surface_fast_e2e() {
+    let mock = MockUpstream::json(
+        401,
+        "Unauthorized",
+        r#"{"error":{"message":"invalid key"}}"#,
+    )
+    .await;
+    let (base, _state) = spawn_server(&pooled_cfg(&mock.url(), vec!["b1", "b2"])).await;
+    let start = std::time::Instant::now();
+    let resp = client()
+        .post(format!("{base}/v1/chat/completions"))
+        .json(&serde_json::json!({"model":"good/m","messages":[]}))
+        .send()
+        .await
+        .unwrap();
+    let elapsed = start.elapsed();
+    assert_eq!(resp.status(), 401, "the last 401 surfaces unchanged");
+    assert!(
+        elapsed < Duration::from_secs(2),
+        "no 120s candidate wait: {elapsed:?}"
+    );
+}
+
+#[tokio::test]
+async fn pool_request_error_fails_fast_e2e() {
+    let mock = MockUpstream::json(400, "Bad Request", r#"{"error":{"message":"bad input"}}"#).await;
+    let (base, _state) = spawn_server(&pooled_cfg(&mock.url(), vec!["k1", "k2"])).await;
+    let resp = client()
+        .post(format!("{base}/v1/chat/completions"))
+        .json(&serde_json::json!({"model":"good/m","messages":[]}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 400, "request-scoped errors fail fast");
+}

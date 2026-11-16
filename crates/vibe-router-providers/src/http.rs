@@ -279,9 +279,26 @@ impl HttpUpstream {
     }
 }
 
-/// HTTP 429 is the signal to cool a specific key and try the next one.
+/// HTTP 429 is the signal to cool a specific key (short backoff) and try the
+/// next one. Pre-SSE streaming errors arrive as `Json`, so this covers both the
+/// non-streaming and streaming paths.
 fn is_rate_limited(resp: &UpstreamResponse) -> bool {
     matches!(resp, UpstreamResponse::Json { status: 429, .. })
+}
+
+/// HTTP 401/403 is a *key* fault (a dead/invalid credential), not a request
+/// fault: retire that key for the long auth cooldown and rotate to the next
+/// healthy key. Like 429, pre-SSE streaming errors arrive as `Json`, so both
+/// paths are covered. Request-scoped errors (400/404/422) are neither key
+/// faults nor rate limits — they fail fast without rotating keys.
+fn is_key_fault(resp: &UpstreamResponse) -> bool {
+    matches!(
+        resp,
+        UpstreamResponse::Json {
+            status: 401 | 403,
+            ..
+        }
+    )
 }
 
 /// A stable identifier for sticky proxy affinity, derived from the credential.
@@ -336,14 +353,16 @@ impl UpstreamClient for HttpUpstream {
         }
 
         // Multi-key pool: try healthy keys in order, each through its sticky
-        // proxy. A 429 cools that key and we retry the next one transparently.
+        // proxy. A 429 (short backoff) or 401/403 (long auth cooldown) cools
+        // that specific key and we retry the next one transparently. Only when
+        // every key is exhausted does the last key-fault status surface.
         let mut attempted: Vec<usize> = Vec::new();
-        let mut last_rate_limited: Option<UpstreamResponse> = None;
+        let mut last_key_error: Option<UpstreamResponse> = None;
 
         loop {
             let Some((idx, secret_ref)) = provider.key_pool.select_healthy_except(&attempted)
             else {
-                return last_rate_limited.unwrap_or_else(|| {
+                return last_key_error.unwrap_or_else(|| {
                     UpstreamResponse::Transport(transport(
                         TransportErrorKind::NoCredential,
                         "all API keys in the pool are cooling down or exhausted".to_string(),
@@ -376,12 +395,25 @@ impl UpstreamClient for HttpUpstream {
                     key_index = idx,
                     "upstream 429: key cooled down, retrying with next key"
                 );
-                last_rate_limited = Some(resp);
+                last_key_error = Some(resp);
                 continue;
             }
 
-            // Only a 2xx resets the key's 429 backoff streak; a 5xx must not
-            // clear a rate-limit cooldown.
+            if is_key_fault(&resp) {
+                // Key fault: retire this key (long cooldown) and rotate. Log
+                // only the key index — never the key material.
+                provider.key_pool.mark_auth_fault(idx);
+                tracing::warn!(
+                    provider = %provider.id,
+                    key_index = idx,
+                    "upstream auth fault (401/403): key retired, retrying with next key"
+                );
+                last_key_error = Some(resp);
+                continue;
+            }
+
+            // Only a 2xx resets the key's cooldown/backoff; a 5xx or a
+            // request-scoped 4xx must not clear it.
             if matches!(&resp, UpstreamResponse::Json { status, .. } if (200..300).contains(status))
                 || matches!(&resp, UpstreamResponse::Stream { .. })
             {

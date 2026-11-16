@@ -356,19 +356,25 @@ those two implementations.
 
 ### Explicitly postponed (and why)
 
-| Feature | Why later |
+Several items originally postponed here have since been implemented and are
+noted as such; the rest remain future work.
+
+| Feature | Status / why later |
 |---|---|
-| Anthropic `/v1/messages`, Gemini, Responses-API formats | Translation surface is large; v0.1 is OpenAI-format in and out. Keeps `vr-translate` honest without exploding it. |
-| `round-robin` / `sticky` / `fusion` strategies | `fallback` covers the value proposition. Strategies are a `SelectionPolicy` swap, easy once the interface exists. |
+| Anthropic `/v1/messages` (in **and** out) | **Implemented.** Full bidirectional tool use, streaming tool calls, and vision; native Anthropic upstreams via configured `format`. |
+| Gemini, Responses-API formats | Later. Translation surface is large; the converter-pair seam is ready. |
+| Key-pool strategies (`round-robin` / `least-loaded` / `weighted`) | **Implemented.** Per-provider multi-key pools with 429 backoff and 401/403 auth-fault retirement. |
+| Combo-level `round-robin` / `sticky` / `fusion` strategies | Later. `fallback` covers the value proposition; a `SelectionPolicy` swap once the interface exists. |
+| Multi-account pools per provider | **Implemented.** See key-pool strategies above. |
+| Cost tracking (micro-dollar pricing) | **Implemented.** Per-request cost from a persisted rate table; cost breakdowns and p50/p95/p99 latency. |
+| Quota tracking / budget enforcement | Later. Builds on the usage accounting that now exists. |
 | Capability auto-switch (vision/pdf reordering) | Needs a capability catalog first. |
 | Model catalog sync (e.g. models.dev) | See Part 6 — designed for now, built later. |
 | Provider auto-discovery | Same. |
 | Automatic combo generation | Same. |
 | OAuth / device-code provider flows | Highest complexity, lowest value for a single-user VPS router. API keys first. |
-| Quota tracking & cost estimation | Needs usage accounting to mature first; usage *logging* is in v0.1. |
-| Explicit health probes | v0.1 availability is error-driven (implicit). Probe slot is reserved. |
-| Multi-account pools per provider | Single credential per provider in v0.1; the account dimension is additive. |
-| Dashboard auth (password/SSO/SAML) | v0.1 trusts loopback + API key; UI auth is a deployment concern. |
+| Explicit upstream health probes | Availability is error-driven with proactive circuit-breaker recovery; active probing is reserved. |
+| Dashboard auth (password/SSO/SAML) | API-key admin auth + CSRF guard **implemented**; password/SSO/SAML remain a deployment concern. |
 | Cloud sync, tunnels, MITM, skills, media providers | Out of scope for the project's purpose. |
 
 The v0.1 boundary is chosen so that a single user can point one client at one

@@ -8,7 +8,8 @@ Vibe Router provides unified OpenAI (`/v1/chat/completions`) and Anthropic (`/v1
 
 ## Key Features
 
-- **Single Lightweight Binary**: Compiled to a ~9.5 MB standalone executable. No Node.js runtime, no Python, no external database dependencies.
+- **Single Lightweight Binary**: Compiled to a ~8.5–9.5 MB standalone executable (≈8.5 MB on x86_64 Linux, ≈9.5 MB on Windows MSVC). No Node.js runtime, no Python, no external database dependencies.
+- **Tiny Memory Footprint**: Reported ~9.2 MB RSS under live traffic plus the dashboard, versus ~265 MB for Node/Next.js gateways. On 1–2 GiB VPS instances, tune `cache.max_memory_mb` down (e.g. `16` or `32`) to bound the LRU cache; the `vps` runtime profile already caps it at 4 MB.
 - **Hardware-Aware Adaptive Runtime**:
   - **Disk-First VPS Mode**: Minimizes RSS footprint (< 30 MB) and restricts cache to 4 MB for small $5/mo VPS instances.
   - **RAM-First Portable Mode**: Hydrates SQLite into host memory (`:memory:`) with periodic crash-safe atomic flush back to disk, providing zero flash wear on USB drives.
@@ -21,12 +22,14 @@ Vibe Router provides unified OpenAI (`/v1/chat/completions`) and Anthropic (`/v1
   - Inbound role tracking (`X-Vibe-Role: boss | code | debug | judge | chat | hermes`) with per-role token & spend accounting.
   - **Judge Retry Bypass (`X-Vibe-Retry: 1`)**: Bypasses the cache and rotates to the next healthy candidate in the chain so code rejected by evaluation judges is retried on an alternative model.
   - **Zero-401 Local Handshake**: Synchronizes `.vibe_router_token` for seamless local agent authentication.
-- **Multi-Key Pool Rotation & 429 Auto-Cooldown**:
+- **Multi-Key Pool Rotation, 429 Backoff & Auth-Fault Retirement**:
   - Supports `RoundRobin`, `LeastLoaded`, and `Weighted` selection strategies across multiple API keys per provider.
   - Upstream 429 rate-limit responses trigger automatic exponential backoff cooldowns and instantly retry the next available healthy key transparently.
+  - A 401/403 on a pooled key is treated as a *key* fault, not a request fault: that key is retired for a long auth cooldown (`auth.auth_cooldown_ms`, default 30 minutes, cleared on successful use or config reload) and the request rotates to the next healthy key — on both non-streaming and streaming paths. Only when every key is exhausted does the last 401/403 surface, unchanged and without a candidate-level cooldown wait.
+  - Request-scoped errors (400/404/422 and validation failures) fail fast: they neither rotate keys nor retry.
 - **High-Capacity In-Memory Prompt & Stream Cache**:
-  - 256 MB LRU cache hashing `(model_id, temperature, top_p, tools, messages_json)` via SHA-256 with sub-millisecond cache hits.
-  - Opt-in stream caching cleanly buffers and replays completed SSE streams.
+  - Bounded LRU cache (256 MB default; profile-tuned) hashing the full response-shaping surface — `model`, `messages`, `tools`, `tool_choice`, `temperature`, `top_p`, `max_tokens`, `stop`, `seed`, `n`, penalties, `response_format`, `logit_bias` — via SHA-256 with sub-millisecond cache hits.
+  - Opt-in stream caching cleanly buffers and replays completed SSE streams; cache hits are recorded as zero-cost usage rows.
 - **Virtual Model Aliasing**:
   - Map arbitrary model names (e.g., `gpt-4o`, `claude-3-7-sonnet`) to underlying combos or provider targets via REST, CLI, or Web UI.
 - **Circuit Breakers & Health Probes**:
@@ -241,9 +244,10 @@ Commands:
 Vibe Router maintains 100% passing tests across all crates with zero warnings:
 
 ```bash
-cargo test --workspace
-cargo clippy --workspace --all-targets -- -D warnings
+cargo test --workspace --all-features
+cargo clippy --workspace --all-targets --all-features -- -D warnings
 cargo fmt --all -- --check
+cargo build --release --workspace
 ```
 
 All integration tests are hermetic and deterministic using an in-process TCP mock upstream that tests real HTTP sockets, chunked SSE streaming, timeouts, disconnects, failover chains, rate limits, and error status classification without relying on external networks or live accounts.

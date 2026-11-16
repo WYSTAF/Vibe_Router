@@ -233,18 +233,21 @@ fn default_error_rules() -> Vec<ErrorRule> {
             backoff: true,
             cooldown_ms: None,
         },
-        // Then status rules.
+        // Then status rules. 401/403 are key faults: the transport rotates to
+        // the next healthy key and cools the offending key (long auth cooldown).
+        // They must NOT cool the whole candidate/model, or a single dead key
+        // would lock out healthy keys in the same pool and trigger the wait loop.
         ErrorRule {
             match_: ErrorRuleMatch::Status(401),
-            fallback: true,
+            fallback: false,
             backoff: false,
-            cooldown_ms: Some(120_000),
+            cooldown_ms: None,
         },
         ErrorRule {
             match_: ErrorRuleMatch::Status(403),
-            fallback: true,
+            fallback: false,
             backoff: false,
-            cooldown_ms: Some(120_000),
+            cooldown_ms: None,
         },
         ErrorRule {
             match_: ErrorRuleMatch::Status(429),
@@ -660,6 +663,10 @@ pub struct AuthConfig {
     /// Selection strategy: "round-robin" (default) or "least-loaded".
     #[serde(default)]
     pub strategy: Option<String>,
+    /// Cooldown (ms) applied to a key that returns 401/403. Defaults to
+    /// 1_800_000 (30 minutes) when unset.
+    #[serde(default)]
+    pub auth_cooldown_ms: Option<u64>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]

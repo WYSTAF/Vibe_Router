@@ -31,7 +31,13 @@ pub struct ProviderKeyPool {
     strategy: KeySelectionStrategy,
     rr_counter: AtomicUsize,
     default_cooldown: Duration,
+    /// Long cooldown for a key that returned an auth fault (401/403). A dead
+    /// key is retired for this long so it is not retried on every request.
+    auth_cooldown: Duration,
 }
+
+/// Default auth-fault key cooldown: 30 minutes.
+pub const DEFAULT_AUTH_COOLDOWN: Duration = Duration::from_secs(1_800);
 
 impl Default for ProviderKeyPool {
     fn default() -> Self {
@@ -59,6 +65,7 @@ impl ProviderKeyPool {
             strategy,
             rr_counter: AtomicUsize::new(0),
             default_cooldown: Duration::from_secs(60),
+            auth_cooldown: DEFAULT_AUTH_COOLDOWN,
         }
     }
 
@@ -81,6 +88,7 @@ impl ProviderKeyPool {
             strategy,
             rr_counter: AtomicUsize::new(0),
             default_cooldown: Duration::from_secs(60),
+            auth_cooldown: DEFAULT_AUTH_COOLDOWN,
         }
     }
 
@@ -92,6 +100,12 @@ impl ProviderKeyPool {
         let mut pool = Self::new(keys, strategy);
         pool.default_cooldown = default_cooldown;
         pool
+    }
+
+    /// Override the auth-fault (401/403) key cooldown.
+    pub fn with_auth_cooldown(mut self, auth_cooldown: Duration) -> Self {
+        self.auth_cooldown = auth_cooldown;
+        self
     }
 
     pub fn empty() -> Self {
@@ -215,6 +229,17 @@ impl ProviderKeyPool {
         if let Some(slot) = slots.get_mut(idx) {
             slot.cooldown_until = None;
             slot.consecutive_429s = 0;
+        }
+    }
+
+    /// Retire a key that returned an auth fault (401/403) for the long auth
+    /// cooldown. Unlike a 429, this is a fixed long lockout (a dead key stays
+    /// dead) rather than exponential backoff. Cleared on successful use or when
+    /// the pool is rebuilt on config reload.
+    pub fn mark_auth_fault(&self, idx: usize) {
+        let mut slots = self.slots.lock();
+        if let Some(slot) = slots.get_mut(idx) {
+            slot.cooldown_until = Some(Instant::now() + self.auth_cooldown);
         }
     }
 

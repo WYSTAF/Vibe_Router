@@ -1671,7 +1671,6 @@ dependencies = [
  "serde_json",
  "sha2",
  "tokio",
- "tracing",
  "vibe-router-core",
 ]
 
@@ -1702,9 +1701,7 @@ dependencies = [
  "serde",
  "serde_json",
  "thiserror 1.0.69",
- "tokio",
  "toml",
- "tracing",
  "vibe-router-core",
 ]
 
@@ -1726,7 +1723,6 @@ dependencies = [
  "parking_lot",
  "serde",
  "tokio",
- "tracing",
  "vibe-router-core",
 ]
 
@@ -1796,7 +1792,6 @@ dependencies = [
  "thiserror 1.0.69",
  "tokio",
  "tracing",
- "vibe-router-core",
 ]
 
 [[package]]
@@ -1807,7 +1802,6 @@ dependencies = [
  "serde",
  "serde_json",
  "tokio",
- "tracing",
  "vibe-router-core",
 ]
 
@@ -1815,7 +1809,6 @@ dependencies = [
 name = "vibe-router-ui"
 version = "0.1.0"
 dependencies = [
- "mime_guess",
  "rust-embed",
 ]
 

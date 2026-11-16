@@ -9,4 +9,3 @@ publish = false
 
 [dependencies]
 rust-embed = "8"
-mime_guess = "2"

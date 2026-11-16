@@ -8,8 +8,6 @@ license = "Apache-2.0"
 publish = false
 
 [dependencies]
-vibe-router-core = { path = "../vibe-router-core" }
-
 rusqlite = { version = "0.31", features = ["bundled", "backup"] }
 serde = { version = "1", features = ["derive"] }
 serde_json.workspace = true

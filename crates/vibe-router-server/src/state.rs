@@ -349,6 +349,7 @@ pub fn provider_from_runtime(
             secrets: Vec::new(),
             api_keys: rp.api_keys.clone(),
             strategy: rp.key_strategy.clone(),
+            auth_cooldown_ms: None,
         },
         api_keys: rp.api_keys.clone(),
         key_strategy: rp.key_strategy.clone(),

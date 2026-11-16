@@ -1,8 +1,9 @@
 //! Configuration for Vibe Router.
 //!
 //! Static configuration lives in TOML; secrets are resolved from the
-//! environment at request time and never appear in config objects. The file is
-//! watched and re-applied on change without dropping in-flight requests.
+//! environment at request time and never appear in config objects. Hot reload
+//! is driven by the server (mtime poll -> `AppState::swap_config`), which keeps
+//! the last good config serving if a reload fails to parse or validate.
 //!
 //! Depends on: vibe-router-core. Nothing else.
 
@@ -10,15 +11,10 @@
 
 mod classify;
 mod error;
-mod file;
 pub mod schema;
 
 pub use classify::ConfigClassifier;
 pub use error::{ConfigError, ConfigResult};
-
-#[cfg(feature = "watch")]
-pub use file::watch;
-pub use file::ConfigSource;
 pub use schema::{
     AuthConfig, AuthScheme, CacheConfig, ComboConfig, ErrorRule, ErrorRuleMatch, LimitsConfig,
     ModelConfig, ProviderConfig, RateLimitConfig, RateLimitScope, RetryConfig, RetryEntry,

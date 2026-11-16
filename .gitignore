@@ -6,6 +6,8 @@
 .env
 .env.*
 *.log
+# Private local deployment config (keep generic examples in vibe-router.toml).
+vibe-router.local.toml
 .vibe_router_token
 *.vibe_router_token
 portable_data/
