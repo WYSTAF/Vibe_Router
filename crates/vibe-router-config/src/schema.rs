@@ -300,6 +300,12 @@ pub struct ServerConfig {
     /// Disable for hermetic tests or locked-down deployments.
     #[serde(default = "default_true")]
     pub auto_discover_proxies: bool,
+    /// Auto-discover local "Vibe Local" worker nodes (this PC and LAN pocket
+    /// workers) via UDP probe plus an HTTP fallback, registering them as
+    /// passthrough OpenAI providers. Disable for hermetic tests or when no
+    /// local nodes are expected.
+    #[serde(default = "default_true")]
+    pub auto_discover_local: bool,
 }
 
 fn default_host() -> String {
@@ -322,6 +328,7 @@ impl Default for ServerConfig {
             log_dir: default_log_dir(),
             allow_local_upstreams: false,
             auto_discover_proxies: true,
+            auto_discover_local: true,
         }
     }
 }

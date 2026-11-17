@@ -121,7 +121,20 @@ impl HttpUpstream {
         let t = &provider.transport;
         let mut builder = client.post(url).json(&req.body);
         for (name, value) in &t.headers {
-            builder = builder.header(name, value);
+            // Header values may carry a secret reference (`env:VAR` / `file:path`)
+            // resolved at request time, so a credential is never stored literally
+            // in the registry. A missing reference simply omits the header.
+            if let Some(var) = value.strip_prefix("env:") {
+                if let Ok(v) = std::env::var(var) {
+                    builder = builder.header(name, v);
+                }
+            } else if let Some(path) = value.strip_prefix("file:") {
+                if let Ok(v) = std::fs::read_to_string(path) {
+                    builder = builder.header(name, v.trim());
+                }
+            } else {
+                builder = builder.header(name, value);
+            }
         }
         if let Some(target) = relay_target {
             builder = builder.header("X-Target-URL", target);

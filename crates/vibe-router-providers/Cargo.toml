@@ -20,7 +20,7 @@ vibe-router-translate = { path = "../vibe-router-translate" }
 reqwest = { version = "0.12", default-features = false, features = [
     "json", "stream", "rustls-tls",
 ] }
-tokio = { version = "1", default-features = false, features = ["sync", "time", "rt"] }
+tokio = { version = "1", default-features = false, features = ["sync", "time", "rt", "net"] }
 async-trait = "0.1"
 parking_lot = "0.12"
 serde = { version = "1.0", features = ["derive"] }

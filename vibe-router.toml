@@ -17,6 +17,12 @@ log_dir = "logs"
 allow_local_upstreams = true
 # Auto-discover host environment proxies and local VPN ports at startup.
 auto_discover_proxies = false
+# Auto-discover local "Vibe Local" worker nodes (this PC + LAN pocket workers).
+# Scans UDP 20131 (loopback + broadcast) and falls back to HTTP 127.0.0.1:20129,
+# registering responding nodes as passthrough OpenAI providers. Built-in default
+# is true; disabled here so the example config never probes the network. Set
+# VIBE_LOCAL_TOKEN in the environment to authenticate against secured nodes.
+auto_discover_local = false
 
 [storage]
 # SQLite database for usage metrics and runtime-authored state.

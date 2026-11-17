@@ -32,11 +32,17 @@ pub use proxy::{
     fnv1a_hash, sticky_proxy_index, ProxyEntry, ProxyPool, ProxyTag, CLOUDFLARE_WORKER_SCRIPT,
 };
 
+pub mod discovery;
+pub use discovery::{discover, reconcile, scan_and_reconcile, DiscoveredNode, DiscoveryConfig};
+
 #[cfg(any(test, feature = "test-mock"))]
 pub mod mock;
 
 #[cfg(test)]
 mod transport_tests;
+
+#[cfg(test)]
+mod discovery_tests;
 
 /// A provider instance built from config.
 #[derive(Debug, Clone)]

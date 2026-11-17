@@ -486,6 +486,31 @@ fn cmd_serve(args: ServeArgs) -> Result<()> {
             });
         }
 
+        // Vibe Local node discovery: an initial pass on startup, then a periodic
+        // rescan alongside the health loop so LAN pocket workers that come online
+        // (or thermal-pause and drop off) are reflected in the registry.
+        if cfg.server.auto_discover_local {
+            let disc_state = state.clone();
+            tokio::spawn(async move {
+                let mut tracked = std::collections::HashSet::new();
+                vibe_router_providers::discovery::scan_and_reconcile(
+                    &disc_state.registry,
+                    &mut tracked,
+                )
+                .await;
+                let mut tick = tokio::time::interval(std::time::Duration::from_secs(15));
+                tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                loop {
+                    tick.tick().await;
+                    vibe_router_providers::discovery::scan_and_reconcile(
+                        &disc_state.registry,
+                        &mut tracked,
+                    )
+                    .await;
+                }
+            });
+        }
+
         // Wait for SIGINT (Ctrl-C) or SIGTERM, then drain and flush.
         shutdown_signal().await;
         tracing::info!("Shutdown signal received, draining in-flight requests...");
