@@ -369,9 +369,9 @@ noted as such; the rest remain future work.
 | Cost tracking (micro-dollar pricing) | **Implemented.** Per-request cost from a persisted rate table; cost breakdowns and p50/p95/p99 latency. |
 | Quota tracking / budget enforcement | Later. Builds on the usage accounting that now exists. |
 | Capability auto-switch (vision/pdf reordering) | Needs a capability catalog first. |
-| Model catalog sync (e.g. models.dev) | See Part 6 — designed for now, built later. |
-| Provider auto-discovery | Same. |
-| Automatic combo generation | Same. |
+| Model catalog sync (e.g. models.dev) | **Implemented.** `RemoteCatalog` (`Vibe_Radar`) sync in `vr-providers::catalog`; credential-preserving merge, SSRF-guarded new providers, `daily-free` auto-combo. See Part 6. |
+| Provider auto-discovery | **Implemented.** `Vibe Local` UDP + HTTP discovery in `vr-providers::discovery` (`server.auto_discover_local`). |
+| Automatic combo generation | **Implemented.** The catalog's `daily_free_chain` builds the `daily-free` runtime combo (alias `free`). |
 | OAuth / device-code provider flows | Highest complexity, lowest value for a single-user VPS router. API keys first. |
 | Explicit upstream health probes | Availability is error-driven with proactive circuit-breaker recovery; active probing is reserved. |
 | Dashboard auth (password/SSO/SAML) | API-key admin auth + CSRF guard **implemented**; password/SSO/SAML remain a deployment concern. |
@@ -385,12 +385,21 @@ with a usable UI — nothing more.
 
 ## Part 6 — Extensibility for discovery, sync, and auto-combos
 
-These three future features are the main reason for the trait/data split. Each
-has a reserved extension point that v0.1 defines but does not implement.
+These three features are the main reason for the trait/data split. Each began as
+a reserved extension point; all three are now **implemented** in `vr-providers`
+(`discovery` and `catalog`) and driven by background tasks in the CLI serve loop,
+with the routing, health, and server crates untouched — exactly the property the
+split was designed to guarantee. The original design notes are kept below.
 
 ### 1. Provider discovery
 
-**Reserved:** `Provider::discover_models() -> Option<DiscoverySource>`
+**Implemented:** `vr-providers::discovery` scans for `Vibe Local` nodes (UDP
+`VIBE_DISCOVER_V1` on port 20131 + an HTTP `GET /v1/models` fallback), ingests
+their model lists, and reconciles them into the registry as passthrough OpenAI
+runtime providers, removing nodes that stop responding. Gated by
+`server.auto_discover_local`; probe targets are injectable for hermetic tests.
+
+**Reserved (original design):** `Provider::discover_models() -> Option<DiscoverySource>`
 
 ```rust
 enum DiscoverySource {
@@ -408,7 +417,16 @@ is already on the trait, so nothing breaks later.
 
 ### 2. Automatic provider synchronization
 
-**Reserved:** a background task type in `vr-server` that owns exactly one job —
+**Implemented:** `vr-providers::catalog::sync_remote_catalog` fetches a
+`Vibe_Radar` `RemoteCatalog` on a bounded 15s / 2 MB budget and reconciles it into
+the registry: existing providers keep their configured transport and auth (only
+new models are merged onto a runtime clone), new catalog-only providers are
+SSRF-guarded and registered anonymously, and stale ids are removed. The CLI serve
+loop runs an initial non-fatal pass plus a periodic task
+(`server.remote_catalog_interval_secs`, 30s floor). The swap is atomic because
+registry reads are snapshot reads.
+
+**Reserved (original design):** a background task type in `vr-server` that owns exactly one job —
 periodically refresh a `DiscoverySource` and hand the result to the registry.
 
 The registry is built as a read-heavy, copy-on-write map behind an `Arc<RwLock>`
@@ -422,7 +440,12 @@ endpoints, cost tier. Sync only fills in model metadata.
 
 ### 3. Automatic model combos
 
-**Reserved:** `vr-combo-gen` (future crate) implementing:
+**Implemented:** catalog sync filters `daily_free_chain` to entries that resolve
+in the registry and upserts a runtime `Combo` named `daily-free`, registering a
+`free` alias when unset; an empty chain removes the combo. The auto-combo is
+indistinguishable from a user-authored one on the request path.
+
+**Reserved (original design):** `vr-combo-gen` (future crate) implementing:
 
 ```rust
 trait ComboGenerator: Send + Sync {

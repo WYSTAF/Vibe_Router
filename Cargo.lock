@@ -1738,6 +1738,7 @@ dependencies = [
  "serde_json",
  "tokio",
  "tracing",
+ "url",
  "vibe-router-config",
  "vibe-router-core",
  "vibe-router-translate",

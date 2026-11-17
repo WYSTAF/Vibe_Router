@@ -306,6 +306,16 @@ pub struct ServerConfig {
     /// local nodes are expected.
     #[serde(default = "default_true")]
     pub auto_discover_local: bool,
+    /// URL of a remote model catalog (Vibe_Radar feed). When set, the router
+    /// periodically merges advertised models onto existing providers (keeping
+    /// their configured credentials), registers new public providers, and
+    /// builds the `daily-free` combo from the feed's `daily_free_chain`.
+    #[serde(default)]
+    pub remote_catalog_url: Option<String>,
+    /// Refresh interval for the remote catalog, in seconds. Clamped to a 30s
+    /// floor by the serve loop. Default 900 (15 minutes).
+    #[serde(default = "default_remote_catalog_interval")]
+    pub remote_catalog_interval_secs: u64,
 }
 
 fn default_host() -> String {
@@ -316,6 +326,9 @@ fn default_port() -> u16 {
 }
 fn default_log_dir() -> String {
     "logs".to_string()
+}
+fn default_remote_catalog_interval() -> u64 {
+    900
 }
 
 impl Default for ServerConfig {
@@ -329,6 +342,8 @@ impl Default for ServerConfig {
             allow_local_upstreams: false,
             auto_discover_proxies: true,
             auto_discover_local: true,
+            remote_catalog_url: None,
+            remote_catalog_interval_secs: default_remote_catalog_interval(),
         }
     }
 }

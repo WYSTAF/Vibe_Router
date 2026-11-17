@@ -511,6 +511,45 @@ fn cmd_serve(args: ServeArgs) -> Result<()> {
             });
         }
 
+        // Remote model catalog (Vibe_Radar): an initial non-fatal sync on
+        // startup, then a periodic refresh that merges advertised models,
+        // registers new public providers, and rebuilds the `daily-free` combo.
+        if let Some(url) = cfg.server.remote_catalog_url.clone() {
+            let cat_state = state.clone();
+            let interval = cfg.server.remote_catalog_interval_secs.max(30);
+            tokio::spawn(async move {
+                let client = reqwest::Client::new();
+                let mut tracked = std::collections::HashSet::new();
+                match vibe_router_providers::catalog::sync_remote_catalog(
+                    &client,
+                    &cat_state.registry,
+                    &url,
+                    &mut tracked,
+                )
+                .await
+                {
+                    Ok(n) => tracing::info!("remote catalog synced: {n} providers"),
+                    Err(e) => tracing::warn!("initial remote catalog sync failed: {e}"),
+                }
+                let mut tick = tokio::time::interval(std::time::Duration::from_secs(interval));
+                tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                loop {
+                    tick.tick().await;
+                    match vibe_router_providers::catalog::sync_remote_catalog(
+                        &client,
+                        &cat_state.registry,
+                        &url,
+                        &mut tracked,
+                    )
+                    .await
+                    {
+                        Ok(n) => tracing::debug!("remote catalog refreshed: {n} providers"),
+                        Err(e) => tracing::warn!("remote catalog sync failed: {e}"),
+                    }
+                }
+            });
+        }
+
         // Wait for SIGINT (Ctrl-C) or SIGTERM, then drain and flush.
         shutdown_signal().await;
         tracing::info!("Shutdown signal received, draining in-flight requests...");

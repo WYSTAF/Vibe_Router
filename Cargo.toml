@@ -9,7 +9,7 @@ edition = "2021"
 rust-version = "1.85"
 description = "A single-binary, Rust-native LLM router with health-aware failover."
 license = "Apache-2.0"
-repository = "https://github.com/WYSTAF/Vibe_Router"
+repository = "https://github.com/Chukar-AI/Vibe_Router"
 publish = false
 
 [dependencies]

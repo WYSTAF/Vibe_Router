@@ -35,6 +35,9 @@ pub use proxy::{
 pub mod discovery;
 pub use discovery::{discover, reconcile, scan_and_reconcile, DiscoveredNode, DiscoveryConfig};
 
+pub mod catalog;
+pub use catalog::{sync_remote_catalog, CatalogModel, CatalogProvider, RemoteCatalog};
+
 #[cfg(any(test, feature = "test-mock"))]
 pub mod mock;
 
@@ -43,6 +46,9 @@ mod transport_tests;
 
 #[cfg(test)]
 mod discovery_tests;
+
+#[cfg(test)]
+mod catalog_tests;
 
 /// A provider instance built from config.
 #[derive(Debug, Clone)]

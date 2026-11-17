@@ -32,6 +32,14 @@ Vibe Router provides unified OpenAI (`/v1/chat/completions`) and Anthropic (`/v1
   - Opt-in stream caching cleanly buffers and replays completed SSE streams; cache hits are recorded as zero-cost usage rows.
 - **Virtual Model Aliasing**:
   - Map arbitrary model names (e.g., `gpt-4o`, `claude-3-7-sonnet`) to underlying combos or provider targets via REST, CLI, or Web UI.
+- **Automatic `Vibe Local` Node Discovery**:
+  - Discovers local worker nodes on this PC and across the LAN via a UDP probe (`VIBE_DISCOVER_V1` on port 20131, loopback + broadcast) with an HTTP fallback (`GET http://127.0.0.1:20129/v1/models`) for hosts that block UDP.
+  - Responding nodes are registered as passthrough OpenAI providers (`vibe-local` for the canonical loopback node, `vibe-local-<host>` for LAN workers) and removed automatically when they stop responding.
+  - Controlled by `server.auto_discover_local` (default `true`). Set `VIBE_LOCAL_TOKEN` in the environment to authenticate against secured nodes; the token is referenced as an `env:` secret and resolved at request time, never stored literally.
+- **Remote Catalog Sync & Auto-Combo (`daily-free`)**:
+  - Point `server.remote_catalog_url` at a `Vibe_Radar` JSON feed; the router refreshes it every `server.remote_catalog_interval_secs` (default 900s, 30s floor) on a bounded 15s / 2 MB budget.
+  - Advertised models are merged onto existing providers **without touching their configured endpoints or credentials**; new catalog-only providers are SSRF-guarded (public `http(s)` hosts only) and registered anonymously.
+  - The feed's `daily_free_chain` is filtered to resolvable `provider/model` entries and upserted as a runtime combo named `daily-free`, with a `free` alias registered when unset. Stale catalog providers and an empty chain are removed on the next pass.
 - **Circuit Breakers & Health Probes**:
   - Per-provider circuit breaker automatically trips to `OPEN` after repeated 5xx errors or timeouts, transitions to `HALF_OPEN` for probing, and resets to `CLOSED` on success.
 - **Tagged Proxy Pools & Cloudflare Worker Relay**:
@@ -214,6 +222,44 @@ To connect Vibe Router as an MCP tool server for Claude Desktop, Cursor, or Herm
   }
 }
 ```
+
+---
+
+## Local Discovery & Remote Catalog
+
+Both features are configured under `[server]` and are off-the-shelf optional:
+
+```toml
+[server]
+# Discover Vibe Local worker nodes on this PC and the LAN (UDP 20131 + HTTP 20129).
+auto_discover_local = true
+
+# Sync a Vibe_Radar model catalog and auto-build the "daily-free" combo (alias "free").
+remote_catalog_url = "https://example.com/vibe-radar/catalog.json"
+remote_catalog_interval_secs = 900   # 15 minutes; clamped to a 30s floor
+```
+
+- **`VIBE_LOCAL_TOKEN`** (environment variable): when set, discovery attaches it as
+  `Authorization: Bearer` and `X-Vibe-Local-Token` on the model probe, and registered
+  nodes reference it as an `env:` secret resolved at request time. It is never written
+  to disk or stored literally in the registry.
+- **Catalog feed shape** (`Vibe_Radar`):
+
+  ```json
+  {
+    "updated_at": "2026-11-18T00:00:00Z",
+    "providers": [
+      { "id": "catpub", "base_url": "https://api.catpub.example/v1/chat/completions",
+        "models": [{ "id": "m1", "context": 8000 }] }
+    ],
+    "daily_free_chain": ["catpub/m1"]
+  }
+  ```
+
+  Existing providers keep their configured endpoint and credentials — the catalog only
+  merges new model metadata. New providers must use a public `http(s)` host (loopback,
+  link-local, and RFC1918 targets are rejected). Target the auto-built chain with the
+  model name `daily-free` or its alias `free`.
 
 ---
 
