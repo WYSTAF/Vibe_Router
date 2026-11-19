@@ -2007,6 +2007,24 @@ async fn runtime_secret_references_rejected_and_no_shadowing() {
         .unwrap();
     assert_eq!(file_key.status(), 400);
 
+    // Header values are resolved at request time too, so an env:/file: ref in a
+    // custom header is the same exfiltration vector and must be rejected.
+    let env_header = c
+        .post(format!("{base}/api/providers"))
+        .json(&serde_json::json!({"id":"evil3","base_url":mock.url(),"headers":[["X-Leak","env:SECRET"]]}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(env_header.status(), 400);
+
+    let file_header = c
+        .post(format!("{base}/api/providers"))
+        .json(&serde_json::json!({"id":"evil4","base_url":mock.url(),"headers":[["X-Leak","file:/etc/passwd"]]}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(file_header.status(), 400);
+
     // Cannot shadow a config-file provider by id.
     let shadow = c
         .post(format!("{base}/api/providers"))

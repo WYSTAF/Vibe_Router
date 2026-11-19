@@ -390,6 +390,10 @@ pub fn openai_chunk_to_anthropic_events(
 
     if chunk_str.trim() == "[DONE]" || state.finished {
         if !state.finished {
+            // An empty stream (or a terminal marker before any content chunk)
+            // must still open the message before closing it, or the client
+            // sees message_delta/message_stop with no message_start.
+            ensure_started(state, &mut out);
             finish_stream(state, &mut out);
         }
         return out;
@@ -400,25 +404,7 @@ pub fn openai_chunk_to_anthropic_events(
         Err(_) => return out,
     };
 
-    if !state.started {
-        state.started = true;
-        out.push(frame(
-            "message_start",
-            json!({
-                "type": "message_start",
-                "message": {
-                    "id": state.message_id,
-                    "type": "message",
-                    "role": "assistant",
-                    "content": [],
-                    "model": state.model,
-                    "stop_reason": null,
-                    "stop_sequence": null,
-                    "usage": {"input_tokens": 0, "output_tokens": 0}
-                }
-            }),
-        ));
-    }
+    ensure_started(state, &mut out);
 
     // Capture provider-reported usage when present (final usage chunk).
     if let Some(u) = parsed.get("usage") {
@@ -510,6 +496,32 @@ pub fn openai_chunk_to_anthropic_events(
     }
 
     out
+}
+
+/// Emit the `message_start` event exactly once, before any content or terminal
+/// events. Idempotent so both the first content chunk and an early `[DONE]`
+/// produce a well-formed stream.
+fn ensure_started(state: &mut AnthropicStreamState, out: &mut Vec<String>) {
+    if state.started {
+        return;
+    }
+    state.started = true;
+    out.push(frame(
+        "message_start",
+        json!({
+            "type": "message_start",
+            "message": {
+                "id": state.message_id,
+                "type": "message",
+                "role": "assistant",
+                "content": [],
+                "model": state.model,
+                "stop_reason": null,
+                "stop_sequence": null,
+                "usage": {"input_tokens": 0, "output_tokens": 0}
+            }
+        }),
+    ));
 }
 
 fn ensure_text_block(state: &mut AnthropicStreamState, out: &mut Vec<String>) -> usize {
@@ -703,5 +715,22 @@ mod tests {
         let evs = openai_chunk_to_anthropic_events("[DONE]", &mut state);
         assert!(evs.iter().any(|e| e.contains("message_delta")));
         assert!(evs.iter().any(|e| e.contains("message_stop")));
+    }
+
+    #[test]
+    fn empty_stream_still_emits_message_start_before_stop() {
+        // A provider that closes the stream with no content chunks must not
+        // produce message_delta/message_stop without a preceding message_start.
+        let mut state = AnthropicStreamState::new("m");
+        let evs = openai_chunk_to_anthropic_events("[DONE]", &mut state);
+        let start = evs.iter().position(|e| e.contains("message_start"));
+        let stop = evs.iter().position(|e| e.contains("message_stop"));
+        assert!(start.is_some(), "missing message_start: {evs:?}");
+        assert!(stop.is_some(), "missing message_stop: {evs:?}");
+        assert!(
+            start.unwrap() < stop.unwrap(),
+            "message_start must precede stop"
+        );
+        assert!(evs.iter().any(|e| e.contains("message_delta")));
     }
 }

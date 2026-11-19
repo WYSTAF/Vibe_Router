@@ -271,6 +271,7 @@ pub struct AnthropicToOpenAiStream {
     tool_indices: HashMap<u64, u64>,
     next_tool_index: u64,
     finish_reason: String,
+    input_tokens: u64,
     output_tokens: u64,
 }
 
@@ -317,6 +318,13 @@ impl AnthropicToOpenAiStream {
                     if let Some(m) = ev.get("message") {
                         if let Some(id) = m.get("id").and_then(Value::as_str) {
                             self.id = id.to_string();
+                        }
+                        if let Some(it) = m
+                            .get("usage")
+                            .and_then(|u| u.get("input_tokens"))
+                            .and_then(Value::as_u64)
+                        {
+                            self.input_tokens = it;
                         }
                     }
                     out.push(self.chunk(json!({"role": "assistant", "content": ""}), None));
@@ -395,7 +403,7 @@ impl AnthropicToOpenAiStream {
                         "object": "chat.completion.chunk",
                         "model": self.model,
                         "choices": [],
-                        "usage": {"prompt_tokens": 0, "completion_tokens": self.output_tokens, "total_tokens": self.output_tokens}
+                        "usage": {"prompt_tokens": self.input_tokens, "completion_tokens": self.output_tokens, "total_tokens": self.input_tokens + self.output_tokens}
                     })
                     .to_string(),
                 );
@@ -477,5 +485,27 @@ mod tests {
         assert!(final_chunks
             .iter()
             .any(|c| c.contains("\"completion_tokens\":9")));
+    }
+
+    #[test]
+    fn stream_captures_input_tokens_from_message_start() {
+        let mut s = AnthropicToOpenAiStream::new("m");
+        let start = json!({
+            "type": "message_start",
+            "message": {"id": "msg_1", "usage": {"input_tokens": 7, "output_tokens": 0}}
+        })
+        .to_string();
+        s.push(&start);
+        let md = json!({"type": "message_delta", "delta": {"stop_reason": "end_turn"}, "usage": {"output_tokens": 9}}).to_string();
+        s.push(&md);
+        let stop = json!({"type": "message_stop"}).to_string();
+        let chunks = s.push(&stop);
+        let usage = chunks
+            .iter()
+            .find(|c| c.contains("\"usage\""))
+            .expect("usage chunk");
+        assert!(usage.contains("\"prompt_tokens\":7"), "{usage}");
+        assert!(usage.contains("\"completion_tokens\":9"), "{usage}");
+        assert!(usage.contains("\"total_tokens\":16"), "{usage}");
     }
 }

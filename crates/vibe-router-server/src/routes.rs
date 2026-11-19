@@ -889,6 +889,18 @@ pub async fn api_provider_create(
     {
         return bad_request("runtime api_keys cannot use `env:` or `file:` secret references");
     }
+    // Header values are resolved at request time too (`env:`/`file:`), so they
+    // are the same exfiltration vector as the auth secret: a runtime provider
+    // must not smuggle host secrets to a chosen base_url via a custom header.
+    if input
+        .headers
+        .iter()
+        .any(|(_, v)| is_forbidden_runtime_secret(v))
+    {
+        return bad_request(
+            "runtime provider headers cannot use `env:` or `file:` secret references",
+        );
+    }
 
     // SSRF guard on the upstream target.
     if let Err(e) = validate_upstream_url(&base_url, state.allow_local_upstreams()) {

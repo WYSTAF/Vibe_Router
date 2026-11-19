@@ -80,6 +80,11 @@ pub struct Registry {
     inner: Arc<RwLock<RegistryData>>,
     runtime: Arc<RwLock<HashMap<String, Combo>>>,
     runtime_providers: Arc<RwLock<HashMap<String, Arc<ConfigProvider>>>>,
+    /// Catalog-advertised models overlaid onto existing providers by id. Kept
+    /// separate from `runtime_providers` so a catalog merge adds models WITHOUT
+    /// shadowing the provider's configured transport/auth — a config hot reload
+    /// stays authoritative for credentials and endpoints.
+    catalog_models: Arc<RwLock<HashMap<String, Vec<ModelSpec>>>>,
     aliases: Arc<RwLock<HashMap<String, String>>>,
     proxies: Arc<proxy::ProxyPool>,
 }
@@ -110,6 +115,7 @@ impl Registry {
             })),
             runtime: Arc::new(RwLock::new(HashMap::new())),
             runtime_providers: Arc::new(RwLock::new(HashMap::new())),
+            catalog_models: Arc::new(RwLock::new(HashMap::new())),
             aliases: Arc::new(RwLock::new(HashMap::new())),
             proxies: Arc::new(proxy::ProxyPool::new()),
         };
@@ -145,6 +151,7 @@ impl Registry {
         for (id, p) in runtime_provs {
             providers.insert(id, p);
         }
+        self.apply_catalog_overlays(&mut providers);
         let mut known = HashSet::new();
         for p in providers.values() {
             for m in &p.models {
@@ -216,6 +223,7 @@ impl Registry {
         for (id, p) in runtime_provs {
             providers.insert(id, p);
         }
+        self.apply_catalog_overlays(&mut providers);
         let mut known = HashSet::new();
         for p in providers.values() {
             for m in &p.models {
@@ -224,6 +232,37 @@ impl Registry {
         }
         data.providers = providers;
         data.known = known;
+    }
+
+    /// Overlay catalog-advertised models onto an existing provider WITHOUT
+    /// shadowing its configured transport/auth. Reapplied on every load/remerge
+    /// so a config hot reload stays authoritative for credentials and endpoints.
+    pub fn set_catalog_models(&self, id: &str, models: Vec<ModelSpec>) {
+        self.catalog_models.write().insert(id.to_string(), models);
+        self.remerge();
+    }
+
+    /// Drop a catalog model overlay (e.g. the provider left the feed).
+    pub fn remove_catalog_models(&self, id: &str) {
+        if self.catalog_models.write().remove(id).is_some() {
+            self.remerge();
+        }
+    }
+
+    fn apply_catalog_overlays(&self, providers: &mut HashMap<String, Arc<ConfigProvider>>) {
+        let overlays = self.catalog_models.read();
+        for (id, extra) in overlays.iter() {
+            let Some(existing) = providers.get(id) else {
+                continue;
+            };
+            let mut merged = (**existing).clone();
+            for m in extra {
+                if !merged.models.iter().any(|x| x.id == m.id) {
+                    merged.models.push(m.clone());
+                }
+            }
+            providers.insert(id.clone(), Arc::new(merged));
+        }
     }
 
     /// Combos authored at runtime rather than in the config file.

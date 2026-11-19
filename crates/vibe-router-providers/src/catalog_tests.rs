@@ -136,6 +136,78 @@ async fn existing_file_provider_keeps_endpoint_and_credentials() {
 }
 
 #[tokio::test]
+async fn catalog_merge_does_not_mask_hot_reloaded_config() {
+    let mut cfg = AppConfig::minimal();
+    cfg.providers = vec![file_provider(
+        "openrouter",
+        "https://openrouter.ai/api/v1/chat/completions",
+        "env:KEY_OLD",
+        vec!["base-model"],
+    )];
+    let registry = Registry::from_config(&cfg);
+
+    let feed = serde_json::json!({
+        "providers": [
+            {"id":"openrouter","base_url":"https://attacker.example/v1/chat/completions",
+             "models":[{"id":"cat-model"}]}
+        ],
+        "daily_free_chain": []
+    })
+    .to_string();
+    let mock = MockUpstream::json(200, "OK", &feed).await;
+    let client = reqwest::Client::new();
+    let mut tracked = HashSet::new();
+
+    sync_remote_catalog(&client, &registry, &mock.url(), &mut tracked)
+        .await
+        .expect("sync ok");
+    let p = registry.provider("openrouter").expect("present");
+    assert!(p.models.iter().any(|m| m.id == "cat-model"));
+    assert_eq!(
+        p.transport.base_url,
+        "https://openrouter.ai/api/v1/chat/completions"
+    );
+
+    // A repeated sync must be idempotent (overlay stores the full advertised
+    // list, not a delta that would erase prior merges).
+    sync_remote_catalog(&client, &registry, &mock.url(), &mut tracked)
+        .await
+        .expect("second sync ok");
+    assert!(registry
+        .provider("openrouter")
+        .unwrap()
+        .models
+        .iter()
+        .any(|m| m.id == "cat-model"));
+
+    // Hot reload rotates the key and changes the endpoint. The catalog merge
+    // must NOT mask the fresh file config.
+    let mut cfg2 = AppConfig::minimal();
+    cfg2.providers = vec![file_provider(
+        "openrouter",
+        "https://new.openrouter.ai/api/v1/chat/completions",
+        "env:KEY_NEW",
+        vec!["base-model"],
+    )];
+    registry.reload(&cfg2);
+    let p2 = registry
+        .provider("openrouter")
+        .expect("present after reload");
+    assert_eq!(
+        p2.transport.base_url, "https://new.openrouter.ai/api/v1/chat/completions",
+        "hot reload must not be masked by a catalog merge"
+    );
+    match &p2.auth {
+        Auth::Bearer { key_pool } => {
+            assert_eq!(key_pool.keys, vec![SecretRef::Env("KEY_NEW".to_string())]);
+        }
+        other => panic!("expected rotated bearer env auth, got {other:?}"),
+    }
+    // The catalog model overlay still applies on top of the fresh config.
+    assert!(p2.models.iter().any(|m| m.id == "cat-model"));
+}
+
+#[tokio::test]
 async fn ssrf_rejects_private_and_non_http_base_urls() {
     let feed = serde_json::json!({
         "providers": [

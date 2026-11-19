@@ -127,24 +127,13 @@ pub async fn sync_remote_catalog(
 
     let mut current: HashSet<String> = HashSet::new();
     for cp in &catalog.providers {
-        if let Some(existing) = registry.provider(&cp.id) {
-            // Preserve the configured transport, auth, and key pool; merge only
-            // newly advertised models onto a runtime clone.
-            let mut models = existing.models.clone();
-            for m in &cp.models {
-                if !models.iter().any(|x| x.id == m.id) {
-                    models.push(m.to_spec());
-                }
-            }
-            registry.set_runtime_provider(ConfigProvider {
-                id: existing.id.clone(),
-                display_name: existing.display_name.clone(),
-                transport: existing.transport.clone(),
-                auth: existing.auth.clone(),
-                models,
-                passthrough: existing.passthrough,
-                key_pool: existing.key_pool.clone(),
-            });
+        if registry.provider(&cp.id).is_some() {
+            // Existing provider (file or runtime): overlay only the advertised
+            // models. Its configured transport, auth, and key pool stay intact
+            // and authoritative — a config hot reload is never masked. The full
+            // advertised list is stored so repeated syncs are idempotent.
+            let specs: Vec<ModelSpec> = cp.models.iter().map(CatalogModel::to_spec).collect();
+            registry.set_catalog_models(&cp.id, specs);
             current.insert(cp.id.clone());
             continue;
         }
@@ -174,6 +163,7 @@ pub async fn sync_remote_catalog(
 
     for id in tracked_providers.difference(&current) {
         registry.remove_runtime_provider(id);
+        registry.remove_catalog_models(id);
     }
     let registered = current.len();
     *tracked_providers = current;
