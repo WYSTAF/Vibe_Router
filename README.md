@@ -4,6 +4,8 @@ A single-binary, lightweight, production-grade Rust LLM routing gateway and dash
 
 Vibe Router provides unified OpenAI (`/v1/chat/completions`) and Anthropic (`/v1/messages`) compatibility and routes requests across any combination of local and cloud providers with data-driven fallback chains (combos), automatic retries, exponential backoff, micro-dollar cost tracking, and an embedded Web UI.
 
+**Repository:** [github.com/ChukarAI/Vibe_Router](https://github.com/ChukarAI/Vibe_Router) · **License:** Apache-2.0
+
 ---
 
 ## Key Features
@@ -297,6 +299,16 @@ cargo build --release --workspace
 ```
 
 All integration tests are hermetic and deterministic using an in-process TCP mock upstream that tests real HTTP sockets, chunked SSE streaming, timeouts, disconnects, failover chains, rate limits, and error status classification without relying on external networks or live accounts.
+
+---
+
+## Ecosystem (ChukarAI)
+
+Vibe Router is the gateway of the ChukarAI local-first AI stack:
+
+- **Vibe Local** — zero-cloud GGUF inference nodes; auto-discovered at `127.0.0.1:20129` / UDP `:20131` and registered as `vibe-local` passthrough providers.
+- **Vibe Radar** — free-tier model radar; its catalog feed drives RemoteCatalog sync and the auto-built `daily-free` combo.
+- **Vibe Assembly** — multi-agent coding workspace that targets this gateway via Vibe-Link (`X-Vibe-Role` inbound, `x-vibe-router-*` telemetry outbound).
 
 ---
 
